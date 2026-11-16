@@ -1,0 +1,56 @@
+name: macOS build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcrun swiftc --version
+
+      - name: Build and self-test (build.sh)
+        working-directory: macOS
+        run: bash build.sh
+
+      - name: Check universal binary
+        working-directory: macOS
+        run: |
+          archs="$(lipo -archs MarketFloat.app/Contents/MacOS/MarketFloat)"
+          echo "archs: $archs"
+          [[ "$archs" == *arm64* && "$archs" == *x86_64* ]]
+          codesign --verify --verbose MarketFloat.app
+
+      - name: Launch smoke test
+        working-directory: macOS
+        run: |
+          open MarketFloat.app
+          sleep 15
+          pgrep -x MarketFloat || { echo "app is not running"; exit 1; }
+          screencapture -x "$RUNNER_TEMP/screen.png" || echo "screenshot unavailable"
+          pkill -x MarketFloat || true
+
+      - name: Package app
+        working-directory: macOS
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent MarketFloat.app "dist/MarketFloat-macOS-app.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MarketFloat-macOS-app
+          path: macOS/dist/MarketFloat-macOS-app.zip
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot
+          path: ${{ runner.temp }}/screen.png
+          if-no-files-found: ignore

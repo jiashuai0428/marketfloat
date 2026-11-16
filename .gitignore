@@ -1,0 +1,5 @@
+*.exe
+*.zip
+macOS/build/
+macOS/MarketFloat.app/
+macOS/dist/

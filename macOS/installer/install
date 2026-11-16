@@ -1,0 +1,68 @@
+#!/bin/bash
+# 币安浮动行情 · macOS 安装程序
+# 在本机编译 MarketFloat.app 并安装到 ~/Applications（个人“应用程序”文件夹），然后打开它。
+set -uo pipefail
+
+RES="$(cd "$(dirname "$0")/../Resources" && pwd)"
+DEST_DIR="$HOME/Applications"
+DEST="$DEST_DIR/币安浮动行情.app"
+TITLE="币安浮动行情"
+
+dialog() {
+  # $1 = 文本, $2 = 图标 (note | caution | stop)
+  /usr/bin/osascript - "$1" "${2:-note}" <<'OSA' >/dev/null 2>&1
+on run argv
+  set msg to item 1 of argv
+  set kind to item 2 of argv
+  if kind is "stop" then
+    display dialog msg with title "币安浮动行情" buttons {"好"} default button 1 with icon stop
+  else if kind is "caution" then
+    display dialog msg with title "币安浮动行情" buttons {"好"} default button 1 with icon caution
+  else
+    display dialog msg with title "币安浮动行情" buttons {"好"} default button 1 with icon note
+  end if
+end run
+OSA
+}
+
+notify() {
+  /usr/bin/osascript -e "display notification \"$1\" with title \"$TITLE\"" >/dev/null 2>&1 || true
+}
+
+# 1. 需要 Apple 免费的“命令行开发者工具”来编译（只需安装一次）。
+if ! /usr/bin/xcode-select -p >/dev/null 2>&1 || ! /usr/bin/xcrun --find swiftc >/dev/null 2>&1; then
+  /usr/bin/xcode-select --install >/dev/null 2>&1 || true
+  dialog "第一次安装需要 Apple 免费的“命令行开发者工具”。
+
+请在弹出的窗口中点“安装”并等待完成（约 5–15 分钟），然后再次双击本安装程序。
+
+如果没有看到弹窗，请打开“终端”运行：xcode-select --install" caution
+  exit 0
+fi
+
+# 2. 在临时目录编译。
+WORK="$(/usr/bin/mktemp -d -t marketfloat)"
+cp "$RES/MarketFloat.swift" "$RES/BinanceContracts.json" "$RES/build.sh" "$WORK/"
+notify "正在编译安装，约需 1 分钟…"
+if ! (cd "$WORK" && /bin/bash build.sh) >"$WORK/build.log" 2>&1; then
+  LOG="$HOME/Desktop/币安浮动行情-安装日志.txt"
+  cp "$WORK/build.log" "$LOG"
+  dialog "安装失败。
+
+日志已保存到桌面：币安浮动行情-安装日志.txt
+请把这个文件发给开发者。" stop
+  exit 1
+fi
+
+# 3. 安装到 ~/Applications，替换旧版本。
+/usr/bin/pkill -x MarketFloat >/dev/null 2>&1 || true
+mkdir -p "$DEST_DIR"
+rm -rf "$DEST"
+cp -R "$WORK/MarketFloat.app" "$DEST"
+rm -rf "$WORK"
+
+dialog "安装完成！
+
+“币安浮动行情”已安装到 个人文件夹 › 应用程序，现在会自动打开。
+以后可以在启动台或聚焦搜索（⌘ 空格）中输入“币安”打开。"
+/usr/bin/open "$DEST"

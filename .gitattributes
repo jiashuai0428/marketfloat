@@ -1,0 +1,6 @@
+*.sh text eol=lf
+*.swift text eol=lf
+*.yml text eol=lf
+macOS/installer/install text eol=lf
+*.exe binary
+*.zip binary
