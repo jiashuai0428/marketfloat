@@ -67,7 +67,153 @@ namespace MarketFloat
         public string Status { get { return StreamFresh ? "币安推送已连接" :
             restConnected ? "币安 REST 已连接" : blocked ? restStatus : streamStatus; } }
         public string Details { get { return "WebSocket 推送（主）: " + streamStatus +
-            "\r\nREST 轮询（备用）: " + restStatus; } }
+            "\r\nREST 轮询（备用）: " + restStatus + "\r\n逐笔成交（价格提醒）: " + tradeStatus; } }
+
+        // ---- Per-trade stream for symbols that have price alerts, so brief spikes are not missed. ----
+        const string TradeUrl = "wss://fstream.binance.com/market/stream?streams=";
+        readonly object tradeLock = new object();
+        HashSet<string> tradeSymbols = new HashSet<string>();
+        Dictionary<string, decimal[]> extremes = new Dictionary<string, decimal[]>(); // symbol -> {min, max}
+        CancellationTokenSource tradeCycle;
+        volatile string tradeStatus = "未启用（没有价格提醒）";
+
+        public void WatchTrades(IEnumerable<string> watch)
+        {
+            var next = new HashSet<string>(watch.Where(symbols.Contains));
+            lock (tradeLock)
+            {
+                if (next.SetEquals(tradeSymbols)) return;
+                tradeSymbols = next;
+                if (tradeCycle != null) tradeCycle.Cancel();
+            }
+        }
+
+        // Lowest and highest traded price per symbol since the previous call.
+        public Dictionary<string, decimal[]> TakeExtremes()
+        {
+            lock (tradeLock)
+            {
+                var result = extremes;
+                extremes = new Dictionary<string, decimal[]>();
+                return result;
+            }
+        }
+
+        void RecordTrade(string symbol, decimal price)
+        {
+            lock (tradeLock)
+            {
+                decimal[] range;
+                if (!extremes.TryGetValue(symbol, out range)) extremes[symbol] = new[] { price, price };
+                else { range[0] = Math.Min(range[0], price); range[1] = Math.Max(range[1], price); }
+            }
+        }
+
+        public bool AcceptTrades(string message)
+        {
+            try
+            {
+                Dictionary<string, object> root;
+                lock (json) root = json.DeserializeObject(message) as Dictionary<string, object>;
+                object data, code, priceText, kind;
+                if (root == null || !root.TryGetValue("data", out data)) return false;
+                var trade = data as Dictionary<string, object>;
+                decimal price;
+                if (trade == null || !trade.TryGetValue("e", out kind) || !Equals(kind, "aggTrade") ||
+                    !trade.TryGetValue("s", out code) || !(code is string) || !symbols.Contains((string)code) ||
+                    !trade.TryGetValue("p", out priceText) || !TryPrice(priceText, out price)) return false;
+                RecordTrade((string)code, price);
+                return true;
+            }
+            catch (ArgumentException) { return false; }
+            catch (InvalidOperationException) { return false; }
+        }
+
+        async Task RunTrades(CancellationToken stop)
+        {
+            int failures = 0;
+            while (!stop.IsCancellationRequested)
+            {
+                string[] list;
+                CancellationTokenSource cycle = CancellationTokenSource.CreateLinkedTokenSource(stop);
+                lock (tradeLock) { list = tradeSymbols.ToArray(); tradeCycle = cycle; }
+                bool ok = true;
+                try
+                {
+                    if (list.Length == 0)
+                    {
+                        tradeStatus = "未启用（没有价格提醒）";
+                        await Task.Delay(Timeout.Infinite, cycle.Token).ConfigureAwait(false);
+                    }
+                    else ok = await TradesOnce(list, cycle.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) { }
+                finally
+                {
+                    lock (tradeLock) { if (tradeCycle == cycle) tradeCycle = null; }
+                    cycle.Dispose();
+                }
+                if (stop.IsCancellationRequested) break;
+                failures = ok ? 0 : Math.Min(failures + 1, 5);
+                if (ok) continue;
+                try { await Task.Delay(1000 * (1 << failures), stop).ConfigureAwait(false); }
+                catch (OperationCanceledException) { break; }
+            }
+        }
+
+        async Task<bool> TradesOnce(string[] list, CancellationToken token)
+        {
+            bool received = false;
+            tradeStatus = "正在连接（" + list.Length + " 个品种）";
+            try
+            {
+                using (var socket = new ClientWebSocket())
+                {
+                    string url = TradeUrl + string.Join("/", list.Select(s => s.ToLowerInvariant() + "@aggTrade"));
+                    using (var dial = CancellationTokenSource.CreateLinkedTokenSource(token))
+                    {
+                        dial.CancelAfter(TimeSpan.FromSeconds(8));
+                        await socket.ConnectAsync(new Uri(url), dial.Token).ConfigureAwait(false);
+                    }
+                    tradeStatus = "已连接（" + list.Length + " 个品种）";
+                    var buffer = new byte[16384];
+                    using (var message = new MemoryStream())
+                    {
+                        while (!token.IsCancellationRequested)
+                        {
+                            message.SetLength(0);
+                            WebSocketReceiveResult part;
+                            using (var read = CancellationTokenSource.CreateLinkedTokenSource(token))
+                            {
+                                read.CancelAfter(TimeSpan.FromSeconds(90)); // quiet contracts can go a while without trades
+                                do
+                                {
+                                    part = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), read.Token).ConfigureAwait(false);
+                                    if (part.MessageType == WebSocketMessageType.Close) { tradeStatus = "连接已关闭，正在重连"; return received; }
+                                    message.Write(buffer, 0, part.Count);
+                                    if (message.Length > 1024 * 1024) return received;
+                                } while (!part.EndOfMessage);
+                            }
+                            if (part.MessageType == WebSocketMessageType.Text &&
+                                AcceptTrades(Encoding.UTF8.GetString(message.GetBuffer(), 0, (int)message.Length)))
+                            {
+                                received = true;
+                                tradeStatus = "实时成交中（" + list.Length + " 个品种）";
+                            }
+                        }
+                    }
+                }
+            }
+            catch (OperationCanceledException) { if (!token.IsCancellationRequested) { tradeStatus = "接收超时，正在重连"; return received; } throw; }
+            catch (Exception ex)
+            {
+                if (!(ex is WebSocketException || ex is SocketException ||
+                    ex is HttpRequestException || ex is IOException || ex is WebException ||
+                    ex is InvalidOperationException || ex is PlatformNotSupportedException)) throw;
+                tradeStatus = NetworkError(ex);
+            }
+            return received;
+        }
 
         public MarketFeed(IEnumerable<Instrument> instruments)
         {
@@ -88,6 +234,7 @@ namespace MarketFloat
         {
             if (symbols.Count == 0) return;
             Task stream = RunStream(stop);
+            Task trades = RunTrades(stop);
             int failures = 0;
             DateTime nextDay = DateTime.MinValue;
             try
@@ -149,6 +296,7 @@ namespace MarketFloat
             catch (OperationCanceledException) { }
             finally { restConnected = false; }
             await stream.ConfigureAwait(false);
+            await trades.ConfigureAwait(false);
         }
 
         async Task RunStream(CancellationToken stop)
@@ -393,6 +541,8 @@ namespace MarketFloat
         readonly List<string> firedLog = new List<string>();
         NotifyIcon tray;
         Icon trayIcon;
+        AlertToast toast;
+        System.Media.SoundPlayer alarm;
         int menuRow = -1;
         readonly List<ToolStripItem> rowItems = new List<ToolStripItem>();
         readonly System.Windows.Forms.Timer clock = new System.Windows.Forms.Timer { Interval = 100 };
@@ -779,6 +929,7 @@ namespace MarketFloat
             }
             var next = new MarketFeed(instruments);
             feed = next;
+            WatchAlertTrades();
             feedStarted = DateTime.UtcNow;
             stop = new CancellationTokenSource();
             if (!testing)
@@ -823,19 +974,28 @@ namespace MarketFloat
         // Fires each alert once when a live price reaches its target, then removes it.
         bool CheckAlerts(DateTime now)
         {
-            if (alerts.Count == 0 || !(feed.Connected || testing)) return false;
+            var trades = feed.TakeExtremes();
+            if (alerts.Count == 0) return false;
             bool fired = false;
             foreach (var alert in alerts.ToList())
             {
+                decimal reached = 0;
+                decimal[] range;
                 Quote quote;
-                if (!displayed.TryGetValue(alert.Symbol, out quote) ||
-                    (frameTime - quote.EventTime).TotalSeconds >= 30 || !alert.Hit(quote.Price)) continue;
+                // Every trade since the last tick (catches brief spikes) ...
+                if (trades.TryGetValue(alert.Symbol, out range) && alert.Hit(alert.Above ? range[1] : range[0]))
+                    reached = alert.Above ? range[1] : range[0];
+                // ... or the latest price, when it is live.
+                else if ((feed.Connected || testing) && displayed.TryGetValue(alert.Symbol, out quote) &&
+                    (frameTime - quote.EventTime).TotalSeconds < 30 && alert.Hit(quote.Price))
+                    reached = quote.Price;
+                if (reached <= 0) continue;
                 alerts.Remove(alert);
                 alertedAt[alert.Symbol] = now;
                 fired = true;
-                Notify(alert, quote.Price);
+                Notify(alert, reached);
             }
-            if (fired) SaveSettings();
+            if (fired) { SaveSettings(); WatchAlertTrades(); }
             return fired;
         }
 
@@ -847,9 +1007,72 @@ namespace MarketFloat
                 "\r\n提醒价：" + alert.Describe(decimals);
             firedLog.Add(alert.Symbol);
             if (testing) return;
-            System.Media.SystemSounds.Exclamation.Play();
-            EnsureTray();
-            tray.ShowBalloonTip(15000, "价格提醒 · " + (item != null ? item.Name : alert.Code), text, ToolTipIcon.Info);
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "  " + text.Replace("\r\n", "  ·  ");
+            var steps = new List<string>();
+            // Each delivery channel is independent: one failing must not stop the others.
+            try { PlayAlarm(); steps.Add("声音"); }
+            catch (Exception ex) { steps.Add("声音失败:" + ex.GetType().Name); }
+            try
+            {
+                // A popup that stays until dismissed, so the alert is seen even when Windows hides notifications.
+                if (toast == null || toast.IsDisposed)
+                {
+                    toast = new AlertToast();
+                    toast.Dismissed += delegate
+                    {
+                        AppendHistory(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "  弹窗已关闭（知道了）");
+                    };
+                }
+                toast.Add(line.Substring(11));
+                toast.ShowNear(Bounds);
+                steps.Add(toast.Visible ? "弹窗" : "弹窗未显示");
+            }
+            catch (Exception ex) { steps.Add("弹窗失败:" + ex.GetType().Name + " " + ex.Message); }
+            try
+            {
+                EnsureTray();
+                tray.ShowBalloonTip(15000, "价格提醒 · " + (item != null ? item.Name : alert.Code), text, ToolTipIcon.Info);
+                steps.Add("系统通知");
+            }
+            catch (Exception ex) { steps.Add("系统通知失败:" + ex.GetType().Name); }
+            AppendHistory(line + "  [" + string.Join(", ", steps) + "]");
+        }
+
+        static readonly string HistoryPath = Path.Combine(Path.GetDirectoryName(SettingsPath), "提醒记录.txt");
+
+        static void AppendHistory(string line)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(HistoryPath));
+                File.AppendAllText(HistoryPath, line + Environment.NewLine, new UTF8Encoding(true));
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+
+        void PlayAlarm()
+        {
+            try
+            {
+                string media = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Media");
+                string sound = new[] { "Alarm01.wav", "Windows Notify System Generic.wav", "notify.wav" }
+                    .Select(name => Path.Combine(media, name)).FirstOrDefault(File.Exists);
+                if (sound == null) { System.Media.SystemSounds.Exclamation.Play(); return; }
+                if (alarm != null) alarm.Dispose();
+                alarm = new System.Media.SoundPlayer(sound);
+                alarm.Play();
+            }
+            catch (Exception ex)
+            {
+                if (!(ex is IOException || ex is InvalidOperationException || ex is UnauthorizedAccessException)) throw;
+                System.Media.SystemSounds.Exclamation.Play();
+            }
+        }
+
+        void WatchAlertTrades()
+        {
+            feed.WatchTrades(alerts.Select(a => a.Symbol));
         }
 
         void EnsureTray()
@@ -882,6 +1105,7 @@ namespace MarketFloat
                 DecimalsFor, preset))
                 dialog.ShowDialog(this);
             SaveSettings();
+            WatchAlertTrades();
             Redraw();
         }
 
@@ -978,6 +1202,8 @@ namespace MarketFloat
             if (disposing)
             {
                 if (tray != null) { tray.Visible = false; tray.Dispose(); }
+                if (toast != null) toast.Dispose();
+                if (alarm != null) alarm.Dispose();
                 if (trayIcon != null) trayIcon.Dispose();
                 clock.Dispose(); menu.Dispose(); tips.Dispose();
                 ui.Dispose(); title.Dispose(); caption.Dispose(); code.Dispose(); miniCode.Dispose();
@@ -1758,6 +1984,31 @@ namespace MarketFloat
                 form.RefreshQuotes();
                 if (form.firedLog.Count != 1) throw new InvalidOperationException("Alert fired twice.");
                 form.RenderTest(directory, "alerts-fired.png");
+
+                // A brief spike seen only in the trade stream must fire the alert even though the last price never got there.
+                form.alerts.Add(new PriceAlert("BTC", true, 69000m));
+                form.WatchAlertTrades();
+                string spike = "{\"stream\":\"btcusdt@aggTrade\",\"data\":{\"e\":\"aggTrade\",\"s\":\"BTCUSDT\",\"p\":\"69000.50\",\"T\":" + (now + 11) + "}}";
+                if (!form.feed.AcceptTrades(spike) || form.feed.AcceptTrades(spike.Replace("BTCUSDT", "FOOUSDT")) ||
+                    form.feed.AcceptTrades("{}"))
+                    throw new InvalidOperationException("Trade stream parsing failed.");
+                form.RefreshQuotes();
+                if (form.firedLog.Count != 2 || form.alerts.Any(a => a.Code == "BTC") || form.displayed["BTCUSDT"].Price != 68150m)
+                    throw new InvalidOperationException("Spike alert validation failed.");
+                using (var popup = new AlertToast())
+                {
+                    popup.Add("first");
+                    popup.Add("second");
+                    popup.ShowNear(form.Bounds);
+                    Application.DoEvents();
+                    if (!popup.Visible || !popup.Lines.StartsWith("second") || popup.Height < 40)
+                        throw new InvalidOperationException("Alert popup validation failed.");
+                    using (var shot = new Bitmap(popup.Width, popup.Height))
+                    {
+                        popup.DrawToBitmap(shot, new Rectangle(Point.Empty, popup.Size));
+                        shot.Save(Path.Combine(directory, "alert-popup.png"));
+                    }
+                }
                 var entries = ParseCatalog("{\"symbols\":[" + TestContract("HYPE", "COIN", "PERPETUAL", "TRADING") + "," +
                     TestContract("ABCD", "EQUITY", "TRADIFI_PERPETUAL", "TRADING") + "," +
                     TestContract("HKD", "HK_EQUITY", "TRADIFI_PERPETUAL", "TRADING") + "," +
@@ -1857,6 +2108,84 @@ namespace MarketFloat
                     new PointF(r.Left + r.Width * .42f, r.Top + r.Height * .74f),
                     new PointF(r.Left + r.Width * .8f, r.Top + r.Height * .28f) });
             graphics.SmoothingMode = mode;
+        }
+    }
+
+    // Topmost popup listing triggered alerts; stays until the user clicks "知道了".
+    sealed class AlertToast : Form
+    {
+        readonly Label body = new Label();
+        readonly List<string> lines = new List<string>();
+        readonly TableLayoutPanel layout;
+
+        public AlertToast()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            ShowInTaskbar = false;
+            TopMost = true;
+            BackColor = Color.FromArgb(30, 36, 46);
+            ForeColor = Widget.Main;
+            Font = new Font("Microsoft YaHei UI", 9.5f);
+            Padding = new Padding(14, 12, 14, 12);
+            AutoScaleMode = AutoScaleMode.Font;
+            Text = "价格提醒";
+
+            layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2, BackColor = BackColor };
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            var title = new Label { Text = "🔔 价格提醒", AutoSize = true, ForeColor = Color.FromArgb(246, 196, 96),
+                Font = new Font("Microsoft YaHei UI", 11, FontStyle.Bold), Margin = new Padding(0, 0, 0, 6) };
+            var dismiss = new Button { Text = "知道了", AutoSize = true, FlatStyle = FlatStyle.Flat, TabStop = false,
+                ForeColor = Widget.Main, BackColor = Color.FromArgb(52, 62, 78), Cursor = Cursors.Hand };
+            dismiss.FlatAppearance.BorderColor = Color.FromArgb(80, 92, 110);
+            dismiss.Click += delegate { lines.Clear(); Hide(); AppendDismissed(); };
+            body.AutoSize = true;
+            body.MaximumSize = new Size(360, 0);
+            body.Margin = new Padding(0, 4, 0, 0);
+            layout.Controls.Add(title, 0, 0);
+            layout.Controls.Add(dismiss, 1, 0);
+            layout.Controls.Add(body, 0, 1);
+            layout.SetColumnSpan(body, 2);
+            Controls.Add(layout);
+            Paint += delegate(object sender, PaintEventArgs e)
+            {
+                using (var edge = new Pen(Color.FromArgb(246, 196, 96), 2)) e.Graphics.DrawRectangle(edge, 1, 1, Width - 2, Height - 2);
+            };
+        }
+
+        protected override bool ShowWithoutActivation { get { return true; } }
+
+        // Topmost tool window that never takes keyboard focus (WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE),
+        // so typing elsewhere can never "press" 知道了 by accident; it closes only by mouse click.
+        protected override CreateParams CreateParams
+        {
+            get { var p = base.CreateParams; p.ExStyle |= 0x00000008 | 0x00000080 | 0x08000000; return p; }
+        }
+
+        public event EventHandler Dismissed;
+        void AppendDismissed() { var handler = Dismissed; if (handler != null) handler(this, EventArgs.Empty); }
+
+        public string Lines { get { return body.Text; } }
+
+        public void Add(string line)
+        {
+            lines.Insert(0, line);
+            if (lines.Count > 6) lines.RemoveAt(lines.Count - 1);
+            body.Text = string.Join("\r\n", lines);
+        }
+
+        public void ShowNear(Rectangle panel)
+        {
+            var need = layout.GetPreferredSize(new Size(372, 0));
+            ClientSize = new Size(Math.Max(300, Math.Min(420, need.Width + Padding.Horizontal)), need.Height + Padding.Vertical);
+            Rectangle area = Screen.FromRectangle(panel).WorkingArea;
+            int x = Math.Max(area.Left, Math.Min(panel.Right - Width, area.Right - Width));
+            int y = panel.Bottom + 8 + Height <= area.Bottom ? panel.Bottom + 8 : Math.Max(area.Top, panel.Top - Height - 8);
+            Location = new Point(x, y);
+            if (!Visible) Show();
+            BringToFront();
+            Invalidate();
         }
     }
 
@@ -2264,10 +2593,22 @@ namespace MarketFloat
         {
             Instrument[] symbols = Widget.Universe.Where(x => x.Default || x.Code == "SNDK").ToArray();
             var feed = new MarketFeed(symbols);
+            feed.WatchTrades(symbols.Select(x => x.Symbol));
+            var seen = new Dictionary<string, decimal[]>();
             string details;
             using (var stop = new CancellationTokenSource())
             {
                 var feeds = feed.Run(stop.Token);
+                for (int i = 0; i < 12; i++)
+                {
+                    await Task.Delay(1000).ConfigureAwait(false);
+                    foreach (var pair in feed.TakeExtremes())
+                    {
+                        decimal[] range;
+                        if (!seen.TryGetValue(pair.Key, out range)) seen[pair.Key] = pair.Value;
+                        else { range[0] = Math.Min(range[0], pair.Value[0]); range[1] = Math.Max(range[1], pair.Value[1]); }
+                    }
+                }
                 for (int i = 0; i < 20; i++)
                 {
                     if (symbols.All(x => feed.Get(x.Symbol) != null) && feed.Status == "币安推送已连接") break;
@@ -2280,8 +2621,11 @@ namespace MarketFloat
             File.WriteAllLines(path, new[] { details }.Concat(symbols.Select(x =>
             {
                 var quote = feed.Get(x.Symbol);
+                decimal[] range;
+                string trades = seen.TryGetValue(x.Symbol, out range)
+                    ? " | trades 12s low " + Widget.PriceText(range[0]) + " high " + Widget.PriceText(range[1]) : " | no trades in 12s";
                 return x.Symbol + " " + (quote == null ? "no response" :
-                    Widget.PriceText(quote.Price) + " 24h " + Widget.ChangeText(quote.Change));
+                    Widget.PriceText(quote.Price) + " 24h " + Widget.ChangeText(quote.Change)) + trades;
             })));
         }
     }

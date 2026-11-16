@@ -247,7 +247,112 @@ final class MarketFeed {
         return locked { restConnected ? "币安 REST 已连接" : blocked ? restStatusText : streamStatusText }
     }
     var details: String {
-        return locked { "WebSocket 推送（主）：\(streamStatusText)\nREST 轮询（备用）：\(restStatusText)" }
+        return locked { "WebSocket 推送（主）：\(streamStatusText)\nREST 轮询（备用）：\(restStatusText)\n逐笔成交（价格提醒）：\(tradeStatusText)" }
+    }
+
+    // MARK: Per-trade stream for alert symbols, so brief spikes are not missed.
+
+    static let tradeBase = "wss://fstream.binance.com/market/stream?streams="
+    private var tradeSymbols: Set<String> = []          // guarded by lock
+    private var extremes: [String: (min: Decimal, max: Decimal)] = [:]   // guarded by lock
+    private var tradeStatusText = "未启用（没有价格提醒）"   // guarded by lock
+    private var tradeSocket: URLSessionWebSocketTask?    // queue only
+    private var tradeLastMessage = Date()                // queue only
+
+    func watchTrades(_ list: [String]) {
+        let next = Set(list).intersection(symbols)
+        queue.async {
+            let changed: Bool = self.locked {
+                guard next != self.tradeSymbols else { return false }
+                self.tradeSymbols = next
+                return true
+            }
+            if changed { self.connectTrades() }
+        }
+    }
+
+    /// Lowest and highest traded price per symbol since the previous call.
+    func takeExtremes() -> [String: (min: Decimal, max: Decimal)] {
+        return locked {
+            let result = extremes
+            extremes = [:]
+            return result
+        }
+    }
+
+    @discardableResult
+    func acceptTrades(_ message: String) -> Bool {
+        guard let data = message.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let root = object as? [String: Any], let trade = root["data"] as? [String: Any],
+              trade["e"] as? String == "aggTrade", let code = trade["s"] as? String, symbols.contains(code),
+              let text = trade["p"] as? String, let price = Format.decimal(text) else { return false }
+        locked {
+            if let range = extremes[code] {
+                extremes[code] = (min: min(range.min, price), max: max(range.max, price))
+            } else {
+                extremes[code] = (min: price, max: price)
+            }
+        }
+        return true
+    }
+
+    private func setTrades(_ text: String) { locked { tradeStatusText = text } }
+
+    private func connectTrades() {
+        tradeSocket?.cancel(with: .goingAway, reason: nil)
+        tradeSocket = nil
+        let list = locked { Array(tradeSymbols).sorted() }
+        guard !stopped, !list.isEmpty else { setTrades("未启用（没有价格提醒）"); return }
+        let streams = list.map { $0.lowercased() + "@aggTrade" }.joined(separator: "/")
+        guard let url = URL(string: MarketFeed.tradeBase + streams) else { return }
+        let task = session.webSocketTask(with: url)
+        task.maximumMessageSize = 1024 * 1024
+        tradeSocket = task
+        tradeLastMessage = Date()
+        setTrades("正在连接（\(list.count) 个品种）")
+        task.resume()
+        receiveTrades(task)
+        tradeWatchdog(task)
+    }
+
+    private func receiveTrades(_ task: URLSessionWebSocketTask) {
+        task.receive { [weak self] result in
+            guard let self = self, self.tradeSocket === task else { return }
+            switch result {
+            case .failure(let error):
+                self.tradesEnded(task, reason: "连接中断 · " + error.localizedDescription)
+            case .success(let message):
+                self.tradeLastMessage = Date()
+                if case .string(let text) = message, self.acceptTrades(text) {
+                    self.setTrades("实时成交中")
+                }
+                self.receiveTrades(task)
+            }
+        }
+    }
+
+    private func tradeWatchdog(_ task: URLSessionWebSocketTask) {
+        queue.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self = self, self.tradeSocket === task else { return }
+            if Date().timeIntervalSince(self.tradeLastMessage) > 90 {   // quiet contracts can go a while without trades
+                self.tradesEnded(task, reason: "接收超时，正在重连")
+            } else {
+                self.tradeWatchdog(task)
+            }
+        }
+    }
+
+    private func tradesEnded(_ task: URLSessionWebSocketTask, reason: String) {
+        guard tradeSocket === task else { return }
+        tradeSocket = nil
+        task.cancel(with: .goingAway, reason: nil)
+        setTrades(reason)
+        guard !stopped else { return }
+        queue.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self = self, self.tradeSocket == nil else { return }
+            self.connectTrades()
+        }
     }
 
     func get(_ symbol: String) -> Quote? {
@@ -259,6 +364,7 @@ final class MarketFeed {
         queue.async {
             self.connectStream()
             self.poll()
+            self.connectTrades()
         }
     }
 
@@ -267,6 +373,8 @@ final class MarketFeed {
             self.stopped = true
             self.socket?.cancel(with: .goingAway, reason: nil)
             self.socket = nil
+            self.tradeSocket?.cancel(with: .goingAway, reason: nil)
+            self.tradeSocket = nil
             self.session.invalidateAndCancel()
         }
     }
@@ -650,6 +758,7 @@ final class WidgetView: NSView {
     private func resetFeed() {
         feed.stop()
         feed = MarketFeed(symbols: visibleInstruments.map { $0.symbol })
+        feed.watchTrades(alerts.map { $0.symbol })
         feedStarted = Date()
         feed.start()
     }
@@ -705,17 +814,49 @@ final class WidgetView: NSView {
 
     /// Fires each alert once when a live price reaches its target, then removes it.
     private func checkAlerts(_ now: Date) -> Bool {
-        guard !alerts.isEmpty, feed.connected else { return false }
+        let trades = feed.takeExtremes()
+        guard !alerts.isEmpty else { return false }
         var fired = false
         for alert in alerts {
-            guard let quote = displayed[alert.symbol], now.timeIntervalSince(quote.time) < 30, alert.hit(quote.price) else { continue }
+            var reached: Decimal?
+            // Every trade since the last tick (catches brief spikes) ...
+            if let range = trades[alert.symbol], alert.hit(alert.above ? range.max : range.min) {
+                reached = alert.above ? range.max : range.min
+            // ... or the latest price, when it is live.
+            } else if feed.connected, let quote = displayed[alert.symbol], now.timeIntervalSince(quote.time) < 30,
+                      alert.hit(quote.price) {
+                reached = quote.price
+            }
+            guard let price = reached else { continue }
             alerts.removeAll { $0 == alert }
             alertedAt[alert.symbol] = now
             fired = true
-            notify(alert, price: quote.price)
+            notify(alert, price: price)
         }
-        if fired { saveSettings() }
+        if fired {
+            saveSettings()
+            feed.watchTrades(alerts.map { $0.symbol })
+        }
         return fired
+    }
+
+    private var hud: AlertHUD?
+
+    private static var historyURL: URL {
+        return Catalog.cacheURL.deletingLastPathComponent().appendingPathComponent("提醒记录.txt")
+    }
+
+    private static func appendHistory(_ line: String) {
+        let url = historyURL
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            handle.closeFile()
+        } else {
+            try? data.write(to: url)
+        }
     }
 
     private func notify(_ alert: PriceAlert, price: Decimal) {
@@ -725,6 +866,14 @@ final class WidgetView: NSView {
             "\n提醒价：" + alert.describe(places)
         NSSound(named: "Glass")?.play()
         NSApp.requestUserAttention(.informationalRequest)
+        let stamp = DateFormatter()
+        stamp.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let line = stamp.string(from: Date()) + "  " + body.replacingOccurrences(of: "\n", with: "  ·  ")
+        // A floating popup that stays until dismissed, in case system notifications are off.
+        if hud == nil { hud = AlertHUD() }
+        hud?.add(String(line.dropFirst(11)))
+        hud?.show(near: panel.frame)
+        WidgetView.appendHistory(line)
         let content = UNMutableNotificationContent()
         content.title = "价格提醒 · " + (item?.name ?? alert.code)
         content.body = body
@@ -745,6 +894,7 @@ final class WidgetView: NSView {
                                  decimals: { [weak self] item in self?.decimals(for: item) ?? -1 })
         alerts = picker.run()
         saveSettings()
+        feed.watchTrades(alerts.map { $0.symbol })
         redraw()
     }
 
@@ -1535,6 +1685,77 @@ final class WatchPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate, N
     }
 }
 
+// MARK: - Triggered-alert popup
+
+/// Floating, non-activating popup listing triggered alerts; it never takes keyboard focus and stays until 知道了 is clicked.
+final class AlertHUD: NSObject {
+    private let panel: NSPanel
+    private let body = NSTextField(wrappingLabelWithString: "")
+    private var lines: [String] = []
+
+    override init() {
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 100),
+                        styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        super.init()
+        panel.level = .statusBar
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        let box = NSView(frame: panel.contentRect(forFrameRect: panel.frame))
+        box.wantsLayer = true
+        box.layer?.backgroundColor = NSColor.rgb(30, 36, 46, 0.97).cgColor
+        box.layer?.cornerRadius = 10
+        box.layer?.borderWidth = 1.5
+        box.layer?.borderColor = Palette.gold.cgColor
+        panel.contentView = box
+
+        let title = NSTextField(labelWithString: "🔔 价格提醒")
+        title.font = NSFont.systemFont(ofSize: 14, weight: .bold)
+        title.textColor = Palette.gold
+        title.frame = NSRect(x: 14, y: 66, width: 200, height: 20)
+        title.autoresizingMask = [.minYMargin]
+        box.addSubview(title)
+
+        let dismiss = NSButton(title: "知道了", target: self, action: #selector(close))
+        dismiss.bezelStyle = .rounded
+        dismiss.frame = NSRect(x: 360 - 96, y: 60, width: 84, height: 30)
+        dismiss.autoresizingMask = [.minXMargin, .minYMargin]
+        dismiss.refusesFirstResponder = true
+        box.addSubview(dismiss)
+
+        body.textColor = Palette.main
+        body.font = NSFont.systemFont(ofSize: 12.5)
+        body.frame = NSRect(x: 14, y: 12, width: 332, height: 44)
+        body.autoresizingMask = [.width, .height]
+        box.addSubview(body)
+    }
+
+    func add(_ line: String) {
+        lines.insert(line, at: 0)
+        if lines.count > 6 { lines.removeLast() }
+        body.stringValue = lines.joined(separator: "\n")
+    }
+
+    func show(near frame: NSRect) {
+        let width: CGFloat = 360
+        let needed = body.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: width - 28, height: 1000)).height ?? 40
+        let height = max(100, needed + 60)
+        let area = NSScreen.screens.first { $0.frame.intersects(frame) }?.visibleFrame ?? NSScreen.main?.visibleFrame ?? frame
+        var origin = NSPoint(x: min(max(area.minX, frame.maxX - width), area.maxX - width), y: frame.minY - 8 - height)
+        if origin.y < area.minY { origin.y = min(frame.maxY + 8, area.maxY - height) }
+        panel.setFrame(NSRect(origin: origin, size: NSSize(width: width, height: height)), display: true)
+        panel.orderFrontRegardless()
+    }
+
+    @objc private func close() {
+        lines.removeAll()
+        panel.orderOut(nil)
+    }
+}
+
 // MARK: - Price alert window
 
 final class AlertPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate, NSWindowDelegate {
@@ -1815,6 +2036,13 @@ func selfTest() -> Bool {
           PriceAlert.parse("XAU<4000")?.above == false && PriceAlert.parse("bad") == nil && PriceAlert.parse("BTC>-1") == nil,
           "alert parse")
     check(PriceAlert.readPrice(" 70,000.5 ") == Decimal(string: "70000.5") && PriceAlert.readPrice("abc") == nil, "alert price input")
+    let tradeFeed = MarketFeed(symbols: ["BTCUSDT"])
+    check(tradeFeed.acceptTrades("{\"stream\":\"btcusdt@aggTrade\",\"data\":{\"e\":\"aggTrade\",\"s\":\"BTCUSDT\",\"p\":\"69000.50\",\"T\":1}}") &&
+          tradeFeed.acceptTrades("{\"stream\":\"btcusdt@aggTrade\",\"data\":{\"e\":\"aggTrade\",\"s\":\"BTCUSDT\",\"p\":\"68000.00\",\"T\":2}}") &&
+          !tradeFeed.acceptTrades("{\"stream\":\"x\",\"data\":{\"e\":\"aggTrade\",\"s\":\"FOOUSDT\",\"p\":\"1.0\",\"T\":1}}") &&
+          !tradeFeed.acceptTrades("{}"), "trade parse")
+    let range = tradeFeed.takeExtremes()["BTCUSDT"]
+    check(range?.max == Decimal(string: "69000.50") && range?.min == 68000 && tradeFeed.takeExtremes().isEmpty, "trade extremes")
     check(alert!.hit(Decimal(string: "70000.5")!) && !alert!.hit(70000) &&
           PriceAlert(code: "XAU", above: false, target: 4000).hit(3999), "alert trigger")
     check(Format.significantScale("70.5500") == 2 && Format.significantScale("64222.50") == 1 &&
