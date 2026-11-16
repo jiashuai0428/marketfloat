@@ -102,6 +102,13 @@ enum Format {
         guard let dot = text.firstIndex(of: ".") else { return 0 }
         return text.distance(from: dot, to: text.endIndex) - 1
     }
+
+    /// Decimals actually used by a price string, ignoring zero padding ("70.5500" -> 2).
+    static func significantScale(_ text: String) -> Int {
+        var trimmed = text
+        while trimmed.contains(".") && trimmed.hasSuffix("0") { trimmed.removeLast() }
+        return scale(trimmed)
+    }
 }
 
 // MARK: - Catalog
@@ -395,7 +402,7 @@ final class MarketFeed {
                 open = value
             }
             let next = Quote(price: price, open: open, time: Date(timeIntervalSince1970: Double(millis) / 1000),
-                             scale: Format.scale(priceText))
+                             scale: Format.significantScale(priceText))
             if let last = last, next.time < last.time {
                 if open > 0 && last.open != open {
                     quotes[code] = Quote(price: last.price, open: open, time: last.time, scale: last.scale)
@@ -1443,6 +1450,8 @@ func selfTest() -> Bool {
     check(Format.price(Decimal(string: "0.12")!, decimals: 5) == "0.12000", "price 5dp")
     check(Format.price(Decimal(string: "1234.5")!, decimals: 0) == "1,235", "price 0dp")
     check(Format.change(0) == "0.00%" && Format.change(nil) == "", "change zero")
+    check(Format.significantScale("70.5500") == 2 && Format.significantScale("64222.50") == 1 &&
+          Format.significantScale("100.000") == 0, "significant scale")
     let sample = "{\"symbols\":[{\"symbol\":\"HYPEUSDT\",\"quoteAsset\":\"USDT\",\"contractType\":\"PERPETUAL\",\"status\":\"TRADING\",\"underlyingType\":\"COIN\",\"filters\":[{\"filterType\":\"PRICE_FILTER\",\"tickSize\":\"0.0010\"}]}," +
         "{\"symbol\":\"ABCDUSDT\",\"quoteAsset\":\"USDT\",\"contractType\":\"TRADIFI_PERPETUAL\",\"status\":\"TRADING\",\"underlyingType\":\"EQUITY\"}," +
         "{\"symbol\":\"HKDUSDT\",\"quoteAsset\":\"USDT\",\"contractType\":\"TRADIFI_PERPETUAL\",\"status\":\"TRADING\",\"underlyingType\":\"HK_EQUITY\"}]}"

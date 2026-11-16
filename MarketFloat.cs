@@ -634,8 +634,10 @@ namespace MarketFloat
             return -1;
         }
 
-        static int Scale(decimal value)
+        // Decimals actually used, ignoring zero padding from the API (70.5500 -> 2).
+        internal static int Scale(decimal value)
         {
+            value /= 1.000000000000000000000000000000000m; // normalizes away trailing zeros
             return (decimal.GetBits(value)[3] >> 16) & 0xFF;
         }
 
@@ -1506,7 +1508,8 @@ namespace MarketFloat
                     form.feed.Get("BTCUSDT").Open != 68000m)
                     throw new InvalidOperationException("Stream open merge validation failed.");
                 if (PriceText(65005.2m, 2) != "65,005.20" || PriceText(0.12m, 5) != "0.12000" || PriceText(1234.5m, 0) != "1,235" ||
-                    ChangeText(0m) != "0.00%" || ChangeText(null) != "")
+                    ChangeText(0m) != "0.00%" || ChangeText(null) != "" ||
+                    Scale(70.5500m) != 2 || Scale(64222.50m) != 1 || Scale(100.000m) != 0)
                     throw new InvalidOperationException("Price precision validation failed.");
                 form.RefreshQuotes();
                 form.Show();

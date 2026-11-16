@@ -40,8 +40,11 @@ jobs:
       - name: Package app
         working-directory: macOS
         run: |
-          mkdir -p dist
-          ditto -c -k --keepParent MarketFloat.app "dist/MarketFloat-macOS-app.zip"
+          mkdir -p "dist/币安浮动行情"
+          ditto MarketFloat.app "dist/币安浮动行情/币安浮动行情.app"
+          cp "installer/使用说明-已编译版.txt" "dist/币安浮动行情/使用说明.txt"
+          codesign --verify --deep "dist/币安浮动行情/币安浮动行情.app"
+          ditto -c -k --keepParent "dist/币安浮动行情" "dist/MarketFloat-macOS-app.zip"
 
       - uses: actions/upload-artifact@v4
         with:
