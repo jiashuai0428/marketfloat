@@ -2,6 +2,7 @@
 // Floating Binance USDⓈ-M perpetual ticker. Single-file AppKit app; build with ./build.sh.
 
 import Cocoa
+import UserNotifications
 
 // MARK: - Model
 
@@ -55,6 +56,37 @@ struct Quote {
 }
 
 enum FeedSource { case price, day, stream }
+
+/// One-shot price alert: fires when the live price reaches `target` from below (`above`) or from above.
+struct PriceAlert: Equatable {
+    let code: String
+    let above: Bool
+    let target: Decimal
+
+    var symbol: String { return code + "USDT" }
+
+    func hit(_ price: Decimal) -> Bool { return above ? price >= target : price <= target }
+
+    func describe(_ decimals: Int) -> String {
+        return (above ? "涨到 ≥ " : "跌到 ≤ ") + Format.price(target, decimals: decimals)
+    }
+
+    var serialized: String { return code + (above ? ">" : "<") + "\(target)" }
+
+    static func parse(_ text: String) -> PriceAlert? {
+        guard let at = text.firstIndex(where: { $0 == ">" || $0 == "<" }), at != text.startIndex else { return nil }
+        let code = String(text[..<at])
+        guard validCode(code), let target = Format.decimal(String(text[text.index(after: at)...])) else { return nil }
+        return PriceAlert(code: code, above: text[at] == ">", target: target)
+    }
+
+    /// Accepts "70000", "70,000.5" or " 0.1234 ".
+    static func readPrice(_ text: String) -> Decimal? {
+        let cleaned = text.replacingOccurrences(of: ",", with: "").replacingOccurrences(of: "，", with: "")
+            .trimmingCharacters(in: .whitespaces)
+        return Format.decimal(cleaned)
+    }
+}
 
 func validCode(_ code: String) -> Bool {
     return !code.isEmpty && code.count <= 40 && code.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" }
@@ -469,6 +501,9 @@ final class WidgetView: NSView {
     private var direction: [String: NSColor] = [:]
     private var changedAt: [String: Date] = [:]
     private var scales: [String: Int] = [:]
+    private var alerts: [PriceAlert] = []
+    private var alertedAt: [String: Date] = [:]
+    private let alertGlowSeconds: TimeInterval = 12
     private var feedStarted = Date()
     private var lastFrame = Date.distantPast
     private var timer: Timer?
@@ -660,8 +695,81 @@ final class WidgetView: NSView {
             }
             displayed[item.symbol] = current
         }
-        let animating = changedAt.values.contains { now.timeIntervalSince($0) < 2.6 }
+        if checkAlerts(now) { changed = true }
+        let animating = changedAt.values.contains { now.timeIntervalSince($0) < 2.6 } ||
+            alertedAt.values.contains { now.timeIntervalSince($0) < alertGlowSeconds }
         if changed || animating || now.timeIntervalSince(lastFrame) >= 1 { redraw() }
+    }
+
+    // MARK: Price alerts
+
+    /// Fires each alert once when a live price reaches its target, then removes it.
+    private func checkAlerts(_ now: Date) -> Bool {
+        guard !alerts.isEmpty, feed.connected else { return false }
+        var fired = false
+        for alert in alerts {
+            guard let quote = displayed[alert.symbol], now.timeIntervalSince(quote.time) < 30, alert.hit(quote.price) else { continue }
+            alerts.removeAll { $0 == alert }
+            alertedAt[alert.symbol] = now
+            fired = true
+            notify(alert, price: quote.price)
+        }
+        if fired { saveSettings() }
+        return fired
+    }
+
+    private func notify(_ alert: PriceAlert, price: Decimal) {
+        let item = catalog.first { $0.code == alert.code }
+        let places = item.map { decimals(for: $0) } ?? -1
+        let body = alert.symbol + (alert.above ? " 已涨到 " : " 已跌到 ") + Format.price(price, decimals: places) +
+            "\n提醒价：" + alert.describe(places)
+        NSSound(named: "Glass")?.play()
+        NSApp.requestUserAttention(.informationalRequest)
+        let content = UNMutableNotificationContent()
+        content.title = "价格提醒 · " + (item?.name ?? alert.code)
+        content.body = body
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+    }
+
+    private func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    @objc private func openAlerts(_ sender: NSMenuItem?) {
+        let preset = sender?.representedObject as? String
+        requestNotificationPermission()
+        let picker = AlertPicker(instruments: visibleInstruments, alerts: alerts, preset: preset,
+                                 quote: { [weak self] symbol in self?.displayed[symbol] },
+                                 decimals: { [weak self] item in self?.decimals(for: item) ?? -1 })
+        alerts = picker.run()
+        saveSettings()
+        redraw()
+    }
+
+    private func drawBell(x: CGFloat, centerY: CGFloat, size: CGFloat, color: NSColor, halo: CGFloat) {
+        let w = size * 0.82, h = size, top = centerY - h / 2
+        NSGraphicsContext.saveGraphicsState()
+        if halo > 0 {
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(halo)
+            shadow.shadowBlurRadius = 2
+            shadow.shadowOffset = .zero
+            shadow.set()
+        }
+        color.setFill()
+        NSBezierPath(roundedRect: NSRect(x: x + w * 0.14, y: top, width: w * 0.72, height: h * 0.7),
+                     xRadius: w * 0.36, yRadius: w * 0.36).fill()
+        let flare = NSBezierPath()
+        flare.move(to: NSPoint(x: x + w * 0.14, y: top + h * 0.4))
+        flare.line(to: NSPoint(x: x + w * 0.86, y: top + h * 0.4))
+        flare.line(to: NSPoint(x: x + w, y: top + h * 0.76))
+        flare.line(to: NSPoint(x: x, y: top + h * 0.76))
+        flare.close()
+        flare.fill()
+        NSBezierPath(ovalIn: NSRect(x: x + w * 0.37, y: top + h * 0.79, width: w * 0.26, height: h * 0.21)).fill()
+        NSGraphicsContext.restoreGraphicsState()
     }
 
     private func fresh(_ item: Instrument) -> Bool {
@@ -730,6 +838,9 @@ final class WidgetView: NSView {
             layoutRows = rows.map { CGFloat(max(14, min(2000, $0))) }
         }
         if defaultsLeft() == nil { defaults.removeObject(forKey: "top") }
+        if let saved = defaults.array(forKey: "alerts") as? [String] {
+            alerts = Array(saved.compactMap(PriceAlert.parse).prefix(100))
+        }
     }
 
     private func saveSettings() {
@@ -741,6 +852,7 @@ final class WidgetView: NSView {
         defaults.set(layoutRows.map { Double($0) }, forKey: "rows")
         defaults.set(Double(panel.frame.minX), forKey: "left")
         defaults.set(Double(panel.frame.maxY), forKey: "top")
+        defaults.set(alerts.map { $0.serialized }, forKey: "alerts")
     }
 
     @objc private func windowMoved() {
@@ -800,9 +912,20 @@ final class WidgetView: NSView {
         feed.stop()
     }
 
-    private func buildMenu() -> NSMenu {
+    private func buildMenu(row: Int = -1) -> NSMenu {
         let menu = NSMenu()
+        let items = visibleInstruments
+        if row >= 0 && firstRow + row < items.count {
+            // Right-clicking a quote row offers an alert for that instrument first.
+            let code = items[firstRow + row].code
+            let quick = menu.addItem(withTitle: "为 \(code) 设置价格提醒…", action: #selector(openAlerts(_:)), keyEquivalent: "")
+            quick.target = self
+            quick.representedObject = code
+            menu.addItem(.separator())
+        }
         menu.addItem(withTitle: "自选品种…", action: #selector(pickInstruments), keyEquivalent: "").target = self
+        let alertTitle = alerts.isEmpty ? "价格提醒…" : "价格提醒（\(alerts.count)）…"
+        menu.addItem(withTitle: alertTitle, action: #selector(openAlerts(_:)), keyEquivalent: "").target = self
         menu.addItem(.separator())
         let pin = menu.addItem(withTitle: "窗口置顶", action: #selector(togglePin), keyEquivalent: "")
         pin.target = self
@@ -826,7 +949,10 @@ final class WidgetView: NSView {
         return menu
     }
 
-    override func menu(for event: NSEvent) -> NSMenu? { return buildMenu() }
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        return buildMenu(row: hitAt(point) == .body ? row(at: point.y) : -1)
+    }
 
     private func showMenu() {
         let anchor = buttonRect(2)
@@ -1158,9 +1284,23 @@ final class WidgetView: NSView {
                 if age < 0.9 { flash = move.withAlphaComponent(0.25 * (1 - age / 0.9)) }
             }
 
+            // A just-triggered alert makes the row pulse gold for a few seconds.
+            let alertAge = alertedAt[item.symbol].map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+            if alertAge < alertGlowSeconds {
+                let pulse = 0.5 + 0.5 * cos(alertAge * .pi * 2 / 1.2)
+                let glow = CGFloat((0.1 + 0.16 * pulse) * (1 - alertAge / alertGlowSeconds))
+                Palette.gold.withAlphaComponent(glow).setFill()
+                NSBezierPath(roundedRect: NSRect(x: 4, y: y + 1, width: width - 8, height: rowH - 2), xRadius: 6, yRadius: 6).fill()
+            }
+
             let codeFont = scaled(compact ? Fonts.miniCode : Fonts.code, scale)
-            write(item.code, codeFont, item.metal ? Palette.gold : Palette.main, left: left, top: y, right: divider - 4,
-                  height: names ? (rowH * 0.56).rounded() : rowH, halo: halo)
+            let codeBox = write(item.code, codeFont, item.metal ? Palette.gold : Palette.main, left: left, top: y, right: divider - 4,
+                                height: names ? (rowH * 0.56).rounded() : rowH, halo: halo)
+            let armed = alerts.contains { $0.code == item.code }
+            if (armed || alertAge < alertGlowSeconds) && codeBox.width > 0 {
+                drawBell(x: codeBox.maxX + 4, centerY: codeBox.midY, size: (compact ? 9 : 10) * min(1.3, scale),
+                         color: armed ? Palette.gold.withAlphaComponent(0.82) : Palette.gold, halo: halo)
+            }
             if names {
                 write(item.name, scaled(Fonts.caption, scale), Palette.muted, left: left, top: y + (rowH * 0.52).rounded(),
                       right: divider - 4, height: (rowH * 0.42).rounded(), halo: halo)
@@ -1395,12 +1535,232 @@ final class WatchPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate, N
     }
 }
 
+// MARK: - Price alert window
+
+final class AlertPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate, NSWindowDelegate {
+    private let window: NSWindow
+    private let symbolButton = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let priceField = NSTextField()
+    private let hint = NSTextField(wrappingLabelWithString: "")
+    private let table = NSTableView()
+    private let instruments: [Instrument]
+    private let quote: (String) -> Quote?
+    private let decimals: (Instrument) -> Int
+    private(set) var alerts: [PriceAlert]
+    private var timer: Timer?
+
+    init(instruments: [Instrument], alerts: [PriceAlert], preset: String?,
+         quote: @escaping (String) -> Quote?, decimals: @escaping (Instrument) -> Int) {
+        self.instruments = instruments
+        self.alerts = alerts
+        self.quote = quote
+        self.decimals = decimals
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 440),
+                          styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        super.init()
+        window.title = "价格提醒"
+        window.minSize = NSSize(width: 480, height: 340)
+        window.delegate = self
+        window.isReleasedWhenClosed = false
+        let content = window.contentView!
+        let w: CGFloat = 580, h: CGFloat = 440
+
+        let symbolLabel = NSTextField(labelWithString: "品种")
+        symbolLabel.frame = NSRect(x: 16, y: h - 40, width: 32, height: 20)
+        symbolLabel.autoresizingMask = [.minYMargin]
+        content.addSubview(symbolLabel)
+        symbolButton.frame = NSRect(x: 50, y: h - 44, width: 200, height: 28)
+        symbolButton.autoresizingMask = [.minYMargin]
+        for item in instruments { symbolButton.addItem(withTitle: item.code + "  ·  " + item.name) }
+        symbolButton.target = self
+        symbolButton.action = #selector(symbolChanged)
+        content.addSubview(symbolButton)
+
+        let priceLabel = NSTextField(labelWithString: "提醒价格")
+        priceLabel.frame = NSRect(x: 264, y: h - 40, width: 60, height: 20)
+        priceLabel.autoresizingMask = [.minYMargin]
+        content.addSubview(priceLabel)
+        priceField.frame = NSRect(x: 326, y: h - 42, width: 130, height: 24)
+        priceField.placeholderString = "例如 70000"
+        priceField.autoresizingMask = [.minYMargin]
+        priceField.delegate = self
+        content.addSubview(priceField)
+        let add = NSButton(title: "添加提醒", target: self, action: #selector(addAlert))
+        add.frame = NSRect(x: 464, y: h - 46, width: 100, height: 32)
+        add.keyEquivalent = "\r"
+        add.autoresizingMask = [.minYMargin, .minXMargin]
+        content.addSubview(add)
+
+        hint.frame = NSRect(x: 16, y: h - 84, width: w - 32, height: 32)
+        hint.textColor = .secondaryLabelColor
+        hint.autoresizingMask = [.width, .minYMargin]
+        content.addSubview(hint)
+
+        let columns: [(String, String, CGFloat)] = [("symbol", "品种", 130), ("rule", "提醒条件", 180), ("now", "当前价", 120), ("state", "状态", 100)]
+        for (id, title, width) in columns {
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
+            column.title = title
+            column.width = width
+            table.addTableColumn(column)
+        }
+        table.rowHeight = 22
+        table.allowsMultipleSelection = true
+        table.usesAlternatingRowBackgroundColors = true
+        table.dataSource = self
+        table.delegate = self
+        let scroller = NSScrollView(frame: NSRect(x: 16, y: 56, width: w - 32, height: h - 148))
+        scroller.documentView = table
+        scroller.hasVerticalScroller = true
+        scroller.borderType = .bezelBorder
+        scroller.autoresizingMask = [.width, .height]
+        content.addSubview(scroller)
+
+        let remove = NSButton(title: "删除所选", target: self, action: #selector(removeSelected))
+        remove.frame = NSRect(x: 12, y: 12, width: 100, height: 32)
+        content.addSubview(remove)
+        let note = NSTextField(labelWithString: "价格触达后会弹出通知并响铃，每条提醒只触发一次。")
+        note.frame = NSRect(x: 120, y: 20, width: 340, height: 18)
+        note.textColor = .secondaryLabelColor
+        content.addSubview(note)
+        let done = NSButton(title: "完成", target: self, action: #selector(finish))
+        done.frame = NSRect(x: w - 106, y: 12, width: 90, height: 32)
+        done.keyEquivalent = "\u{1b}"
+        done.autoresizingMask = [.minXMargin]
+        content.addSubview(done)
+
+        if let preset = preset, let index = instruments.firstIndex(where: { $0.code == preset }) {
+            symbolButton.selectItem(at: index)
+        }
+        prefill()
+        table.reloadData()
+    }
+
+    func run() -> [PriceAlert] {
+        NSApp.activate(ignoringOtherApps: true)
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(priceField)
+        let refresh = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            self?.table.reloadData()
+            self?.updateHint()
+        }
+        RunLoop.main.add(refresh, forMode: .modalPanel)
+        timer = refresh
+        NSApp.runModal(for: window)
+        timer?.invalidate()
+        window.orderOut(nil)
+        return alerts
+    }
+
+    private var current: Instrument? {
+        let index = symbolButton.indexOfSelectedItem
+        return index >= 0 && index < instruments.count ? instruments[index] : nil
+    }
+
+    @objc private func symbolChanged() { prefill() }
+
+    private func prefill() {
+        if let item = current, let now = quote(item.symbol) {
+            priceField.stringValue = Format.price(now.price, decimals: decimals(item)).replacingOccurrences(of: ",", with: "")
+        } else {
+            priceField.stringValue = ""
+        }
+        updateHint()
+    }
+
+    func controlTextDidChange(_ obj: Notification) { updateHint() }
+
+    private func updateHint() {
+        guard let item = current else { hint.stringValue = "请先在“自选品种”中添加品种。"; return }
+        guard let now = quote(item.symbol) else { hint.stringValue = "\(item.symbol) 暂未收到价格。"; return }
+        let places = decimals(item)
+        let base = "当前价 " + Format.price(now.price, decimals: places)
+        if let target = PriceAlert.readPrice(priceField.stringValue), target != now.price {
+            let change = NSDecimalNumber(decimal: (target - now.price) / now.price).doubleValue
+            hint.stringValue = base + " → 将在价格" + (target > now.price ? "涨到 ≥ " : "跌到 ≤ ") +
+                Format.price(target, decimals: places) + " 时提醒（" + Format.change(change) + "）"
+        } else {
+            hint.stringValue = base + "。输入高于当前价 = 涨到提醒，低于当前价 = 跌到提醒。"
+        }
+    }
+
+    @objc private func addAlert() {
+        if let error = validateAndAdd() {
+            let alert = NSAlert()
+            alert.messageText = error
+            alert.beginSheetModal(for: window, completionHandler: nil)
+        }
+    }
+
+    /// Returns an error message, or nil when the alert was added.
+    private func validateAndAdd() -> String? {
+        guard let item = current else { return "请先在“自选品种”中添加品种。" }
+        guard let target = PriceAlert.readPrice(priceField.stringValue) else { return "请输入有效的提醒价格，例如 70000。" }
+        guard let now = quote(item.symbol) else { return "\(item.symbol) 暂未收到价格，请稍后再试。" }
+        if target == now.price { return "提醒价格不能等于当前价。" }
+        if alerts.count >= 100 { return "提醒数量已达上限（100 条）。" }
+        let alert = PriceAlert(code: item.code, above: target > now.price, target: target)
+        if alerts.contains(alert) { return "已经有相同的提醒了。" }
+        alerts.append(alert)
+        table.reloadData()
+        priceField.stringValue = ""
+        updateHint()
+        return nil
+    }
+
+    @objc private func removeSelected() {
+        let rows = table.selectedRowIndexes
+        alerts = alerts.enumerated().filter { !rows.contains($0.offset) }.map { $0.element }
+        table.reloadData()
+    }
+
+    @objc private func finish() { NSApp.stopModal() }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        NSApp.stopModal()
+        return true
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { return alerts.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard row < alerts.count, let id = tableColumn?.identifier.rawValue else { return nil }
+        let alert = alerts[row]
+        let item = instruments.first { $0.code == alert.code }
+        let places = item.map { decimals($0) } ?? -1
+        let text: String
+        switch id {
+        case "symbol": text = alert.symbol
+        case "rule": text = alert.describe(places)
+        case "now": text = quote(alert.symbol).map { Format.price($0.price, decimals: places) } ?? "—"
+        default: text = item == nil ? "不在自选中" : "等待触发"
+        }
+        let label = NSTextField(labelWithString: text)
+        label.lineBreakMode = .byTruncatingTail
+        if item == nil { label.textColor = .secondaryLabelColor }
+        return label
+    }
+}
+
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     var widget: WidgetView?
 
+    // Show alert banners even while the app is in front.
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        widget?.show()
+        completionHandler()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UNUserNotificationCenter.current().delegate = self
         let menu = NSMenu()
         let appItem = NSMenuItem()
         menu.addItem(appItem)
@@ -1450,6 +1810,13 @@ func selfTest() -> Bool {
     check(Format.price(Decimal(string: "0.12")!, decimals: 5) == "0.12000", "price 5dp")
     check(Format.price(Decimal(string: "1234.5")!, decimals: 0) == "1,235", "price 0dp")
     check(Format.change(0) == "0.00%" && Format.change(nil) == "", "change zero")
+    let alert = PriceAlert.parse("BTC>70000.5")
+    check(alert != nil && alert!.above && alert!.target == Decimal(string: "70000.5") && alert!.serialized == "BTC>70000.5" &&
+          PriceAlert.parse("XAU<4000")?.above == false && PriceAlert.parse("bad") == nil && PriceAlert.parse("BTC>-1") == nil,
+          "alert parse")
+    check(PriceAlert.readPrice(" 70,000.5 ") == Decimal(string: "70000.5") && PriceAlert.readPrice("abc") == nil, "alert price input")
+    check(alert!.hit(Decimal(string: "70000.5")!) && !alert!.hit(70000) &&
+          PriceAlert(code: "XAU", above: false, target: 4000).hit(3999), "alert trigger")
     check(Format.significantScale("70.5500") == 2 && Format.significantScale("64222.50") == 1 &&
           Format.significantScale("100.000") == 0, "significant scale")
     let sample = "{\"symbols\":[{\"symbol\":\"HYPEUSDT\",\"quoteAsset\":\"USDT\",\"contractType\":\"PERPETUAL\",\"status\":\"TRADING\",\"underlyingType\":\"COIN\",\"filters\":[{\"filterType\":\"PRICE_FILTER\",\"tickSize\":\"0.0010\"}]}," +

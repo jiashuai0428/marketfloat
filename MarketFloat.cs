@@ -305,6 +305,37 @@ namespace MarketFloat
         }
     }
 
+    sealed class PriceAlert
+    {
+        public readonly string Code;
+        public readonly bool Above;   // true: fire when price >= Target; false: when price <= Target
+        public readonly decimal Target;
+        public PriceAlert(string code, bool above, decimal target) { Code = code; Above = above; Target = target; }
+        public string Symbol { get { return Code + "USDT"; } }
+        public bool Hit(decimal price) { return Above ? price >= Target : price <= Target; }
+        public string Describe(int decimals) { return (Above ? "涨到 ≥ " : "跌到 ≤ ") + Widget.PriceText(Target, decimals); }
+        public string Serialize() { return Code + (Above ? ">" : "<") + Target.ToString(CultureInfo.InvariantCulture); }
+
+        public static PriceAlert Parse(string text)
+        {
+            int at = text.IndexOfAny(new[] { '>', '<' });
+            if (at <= 0) return null;
+            string code = text.Substring(0, at);
+            decimal target;
+            if (!code.All(c => char.IsLetterOrDigit(c) || c == '_') || code.Length > 40 ||
+                !decimal.TryParse(text.Substring(at + 1), NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out target) ||
+                target <= 0) return null;
+            return new PriceAlert(code, text[at] == '>', target);
+        }
+
+        // Accepts "70000", "70,000.5" or " 0.1234 ".
+        public static bool TryReadPrice(string text, out decimal price)
+        {
+            return decimal.TryParse((text ?? "").Replace(",", "").Replace("，", "").Trim(), NumberStyles.AllowDecimalPoint,
+                CultureInfo.InvariantCulture, out price) && price > 0;
+        }
+    }
+
     enum Hit { None, Body, Menu, Compact, Close, Grip }
 
     sealed class Widget : Form
@@ -357,6 +388,13 @@ namespace MarketFloat
         readonly Dictionary<string, Color> direction = new Dictionary<string, Color>();
         readonly Dictionary<string, DateTime> changedAt = new Dictionary<string, DateTime>();
         readonly Dictionary<string, int> scales = new Dictionary<string, int>();
+        readonly List<PriceAlert> alerts = new List<PriceAlert>();
+        readonly Dictionary<string, DateTime> alertedAt = new Dictionary<string, DateTime>();
+        readonly List<string> firedLog = new List<string>();
+        NotifyIcon tray;
+        Icon trayIcon;
+        int menuRow = -1;
+        readonly List<ToolStripItem> rowItems = new List<ToolStripItem>();
         readonly System.Windows.Forms.Timer clock = new System.Windows.Forms.Timer { Interval = 100 };
         readonly ContextMenuStrip menu = new ContextMenuStrip();
         readonly ToolTip tips = new ToolTip { InitialDelay = 500, ReshowDelay = 100 };
@@ -446,6 +484,8 @@ namespace MarketFloat
                     ApplySelection();
                 }
             });
+            var alertItem = new ToolStripMenuItem("价格提醒…", null, delegate { OpenAlerts(null); });
+            menu.Items.Add(alertItem);
             menu.Items.Add(new ToolStripSeparator());
             pin = new ToolStripMenuItem("窗口置顶") { Checked = TopMost, CheckOnClick = true };
             pin.Click += delegate { TopMost = pin.Checked; SaveSettings(); };
@@ -477,7 +517,21 @@ namespace MarketFloat
             menu.Items.Add("最小化到任务栏", null, delegate { WindowState = FormWindowState.Minimized; });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("退出", null, delegate { Close(); });
-            menu.Opening += delegate { pin.Checked = TopMost; };
+            menu.Opening += delegate
+            {
+                pin.Checked = TopMost;
+                alertItem.Text = alerts.Count > 0 ? "价格提醒（" + alerts.Count + "）…" : "价格提醒…";
+                foreach (var extra in rowItems) { menu.Items.Remove(extra); extra.Dispose(); }
+                rowItems.Clear();
+                // Right-clicking a quote row offers an alert for that instrument first.
+                var row = menuRow >= 0 ? VisibleInstruments.Skip(firstRow + menuRow).FirstOrDefault() : null;
+                menuRow = -1;
+                if (row == null) return;
+                string code = row.Code;
+                rowItems.Add(new ToolStripMenuItem("为 " + code + " 设置价格提醒…", null, delegate { OpenAlerts(code); }));
+                rowItems.Add(new ToolStripSeparator());
+                for (int i = rowItems.Count - 1; i >= 0; i--) menu.Items.Insert(0, rowItems[i]);
+            };
             menu.Closed += delegate { Redraw(); };
             ContextMenuStrip = menu;
 
@@ -756,8 +810,79 @@ namespace MarketFloat
                 }
                 displayed[item.Symbol] = current;
             }
-            bool animating = changedAt.Values.Any(t => (now - t).TotalSeconds < 2.6);
+            if (CheckAlerts(now)) changed = true;
+            bool animating = changedAt.Values.Any(t => (now - t).TotalSeconds < 2.6) ||
+                alertedAt.Values.Any(t => (now - t).TotalSeconds < AlertGlowSeconds);
             if (changed || animating || (now - lastFrame).TotalMilliseconds >= 1000) Redraw();
+        }
+
+        // ---------- Price alerts ----------
+
+        const double AlertGlowSeconds = 12;
+
+        // Fires each alert once when a live price reaches its target, then removes it.
+        bool CheckAlerts(DateTime now)
+        {
+            if (alerts.Count == 0 || !(feed.Connected || testing)) return false;
+            bool fired = false;
+            foreach (var alert in alerts.ToList())
+            {
+                Quote quote;
+                if (!displayed.TryGetValue(alert.Symbol, out quote) ||
+                    (frameTime - quote.EventTime).TotalSeconds >= 30 || !alert.Hit(quote.Price)) continue;
+                alerts.Remove(alert);
+                alertedAt[alert.Symbol] = now;
+                fired = true;
+                Notify(alert, quote.Price);
+            }
+            if (fired) SaveSettings();
+            return fired;
+        }
+
+        void Notify(PriceAlert alert, decimal price)
+        {
+            var item = catalog.FirstOrDefault(i => i.Code == alert.Code);
+            int decimals = item != null ? DecimalsFor(item) : -1;
+            string text = alert.Symbol + (alert.Above ? " 已涨到 " : " 已跌到 ") + PriceText(price, decimals) +
+                "\r\n提醒价：" + alert.Describe(decimals);
+            firedLog.Add(alert.Symbol);
+            if (testing) return;
+            System.Media.SystemSounds.Exclamation.Play();
+            EnsureTray();
+            tray.ShowBalloonTip(15000, "价格提醒 · " + (item != null ? item.Name : alert.Code), text, ToolTipIcon.Info);
+        }
+
+        void EnsureTray()
+        {
+            if (tray != null) return;
+            tray = new NotifyIcon { Text = "币安浮动行情", ContextMenuStrip = menu, Visible = true };
+            using (var bitmap = new Bitmap(32, 32))
+            {
+                using (var graphics = Graphics.FromImage(bitmap))
+                {
+                    graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                    FillRounded(graphics, Color.FromArgb(255, 22, 28, 37), new RectangleF(1, 1, 30, 30), 7);
+                    using (var dot = new SolidBrush(Green)) graphics.FillEllipse(dot, 9, 9, 14, 14);
+                }
+                IntPtr handle = bitmap.GetHicon();
+                trayIcon = (Icon)Icon.FromHandle(handle).Clone();
+                DestroyIcon(handle);
+            }
+            tray.Icon = trayIcon;
+            tray.DoubleClick += delegate { BringToFront(); Activate(); };
+            tray.BalloonTipClicked += delegate { BringToFront(); Activate(); };
+        }
+
+        [DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr handle);
+
+        void OpenAlerts(string preset)
+        {
+            using (var dialog = new AlertDialog(VisibleInstruments.ToList(), alerts,
+                symbol => { Quote q; return displayed.TryGetValue(symbol, out q) ? q : null; },
+                DecimalsFor, preset))
+                dialog.ShowDialog(this);
+            SaveSettings();
+            Redraw();
         }
 
         bool Fresh(Instrument item)
@@ -790,6 +915,8 @@ namespace MarketFloat
                 int level;
                 if (lines.Length >= 11 && int.TryParse(lines[10], out level) && level >= 0 && level <= 100)
                     opacity = level;
+                if (lines.Length >= 12)
+                    alerts.AddRange(lines[11].Split(';').Select(PriceAlert.Parse).Where(a => a != null).Take(100));
                 bool value;
                 if (bool.TryParse(lines[0], out value)) compact = value;
                 if (bool.TryParse(lines[1], out value)) TopMost = value;
@@ -819,7 +946,8 @@ namespace MarketFloat
                     string.Join(",", selected), (opacity < 100).ToString(),
                     layoutWidths[0].ToString(CultureInfo.InvariantCulture), layoutRows[0].ToString(CultureInfo.InvariantCulture),
                     layoutWidths[1].ToString(CultureInfo.InvariantCulture), layoutRows[1].ToString(CultureInfo.InvariantCulture),
-                    opacity.ToString(CultureInfo.InvariantCulture) });
+                    opacity.ToString(CultureInfo.InvariantCulture),
+                    string.Join(";", alerts.Select(a => a.Serialize())) });
             }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
@@ -849,6 +977,8 @@ namespace MarketFloat
         {
             if (disposing)
             {
+                if (tray != null) { tray.Visible = false; tray.Dispose(); }
+                if (trayIcon != null) trayIcon.Dispose();
                 clock.Dispose(); menu.Dispose(); tips.Dispose();
                 ui.Dispose(); title.Dispose(); caption.Dispose(); code.Dispose(); miniCode.Dispose();
                 digits.Dispose(); miniDigits.Dispose(); change24.Dispose();
@@ -918,6 +1048,7 @@ namespace MarketFloat
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
+            if (e.Button == MouseButtons.Right) menuRow = HitTest(e.Location) == Hit.Body ? RowAt(e.Y) : -1;
             if (e.Button != MouseButtons.Left) return;
             Hit hit = HitTest(e.Location);
             if (hit == Hit.Grip)
@@ -1222,6 +1353,24 @@ namespace MarketFloat
             }
         }
 
+        void DrawBell(Graphics graphics, float x, float cy, float size, Color color, int halo)
+        {
+            float w = size * .82f, h = size, top = cy - h / 2;
+            using (var path = new GraphicsPath())
+            {
+                path.AddArc(x + w * .14f, top, w * .72f, h * .8f, 180, 180);
+                path.AddLine(x + w * .86f, top + h * .4f, x + w, top + h * .76f);
+                path.AddLine(x + w, top + h * .76f, x, top + h * .76f);
+                path.AddLine(x, top + h * .76f, x + w * .14f, top + h * .4f);
+                path.CloseFigure();
+                path.AddEllipse(x + w * .37f, top + h * .79f, w * .26f, h * .21f);
+                if (halo > 0)
+                    using (var pen = new Pen(Color.FromArgb(halo, 0, 0, 0), Pf(1.6f)) { LineJoin = LineJoin.Round })
+                        graphics.DrawPath(pen, path);
+                using (var brush = new SolidBrush(color)) graphics.FillPath(brush, path);
+            }
+        }
+
         void DrawIcon(Graphics graphics, Hit kind, RectangleF rect, Color ink, int halo)
         {
             float cx = rect.X + rect.Width / 2f, cy = rect.Y + rect.Height / 2f, s = rect.Width * .2f;
@@ -1361,9 +1510,23 @@ namespace MarketFloat
                     if (age < .9) flash = Fade(move, (int)(64 * (1 - age / .9)));
                 }
 
+                // A just-triggered alert makes the row pulse gold for a few seconds.
+                DateTime alerted;
+                double alertAge = alertedAt.TryGetValue(item.Symbol, out alerted) ? (now - alerted).TotalSeconds : double.MaxValue;
+                if (alertAge < AlertGlowSeconds)
+                {
+                    double pulse = .5 + .5 * Math.Cos(alertAge * Math.PI * 2 / 1.2);
+                    int glow = (int)((24 + 40 * pulse) * (1 - alertAge / AlertGlowSeconds));
+                    FillRounded(graphics, Fade(Gold, glow), new RectangleF(Px(4), y + Pf(1), width - Px(8), rowHeight - Pf(2)), Pf(6));
+                }
+
                 Font codeFont = compact ? miniCode : code;
-                Write(graphics, item.Code, codeFont, item.Metal ? Gold : Main, left, y, divider - Px(4),
+                RectangleF codeBox = Write(graphics, item.Code, codeFont, item.Metal ? Gold : Main, left, y, divider - Px(4),
                     names ? (int)(rowHeight * .56) : rowHeight, halo, scale);
+                bool armed = alerts.Any(a => a.Code == item.Code);
+                if ((armed || alertAge < AlertGlowSeconds) && codeBox.Width > 0)
+                    DrawBell(graphics, codeBox.Right + Pf(4), codeBox.Top + codeBox.Height / 2, Pf(compact ? 9 : 10) * (float)Math.Min(1.3, scale),
+                        armed ? Fade(Gold, 210) : Gold, halo);
                 if (names)
                     Write(graphics, item.Name, caption, Muted, left, y + (int)(rowHeight * .52), divider - Px(4),
                         (int)(rowHeight * .42), halo, scale);
@@ -1560,6 +1723,41 @@ namespace MarketFloat
                 form.ClientSize = new Size(form.ClientSize.Width, form.Px(260));
                 form.ScrollQuotes(2);
                 form.RenderTest(directory, "scrolled.png");
+
+                // Price alerts: parse, dialog, trigger once, persistence format.
+                var parsed = PriceAlert.Parse("BTC>70000.5");
+                decimal typed;
+                if (parsed == null || !parsed.Above || parsed.Target != 70000.5m || parsed.Serialize() != "BTC>70000.5" ||
+                    PriceAlert.Parse("XAU<4000").Above || PriceAlert.Parse("bad") != null || PriceAlert.Parse("BTC>-1") != null ||
+                    !PriceAlert.TryReadPrice(" 70,000.5 ", out typed) || typed != 70000.5m || PriceAlert.TryReadPrice("abc", out typed))
+                    throw new InvalidOperationException("Alert parsing validation failed.");
+                form.firstRow = 0;
+                using (var dialog = new AlertDialog(form.VisibleInstruments.ToList(), form.alerts,
+                    s => { Quote q; return form.displayed.TryGetValue(s, out q) ? q : null; }, form.DecimalsFor, "BTC"))
+                {
+                    dialog.Show(form);
+                    Application.DoEvents();
+                    dialog.SetForTest("BTC", "68,100");
+                    string first = dialog.AddAlert();
+                    dialog.SetForTest("XAU", "4000");
+                    string second = dialog.AddAlert();
+                    dialog.SetForTest("XAU", "4000");
+                    string duplicate = dialog.AddAlert();
+                    dialog.SetForTest("BTC", "0");
+                    string invalid = dialog.AddAlert();
+                    if (first != null || second != null || duplicate == null || invalid == null || form.alerts.Count != 2 ||
+                        !form.alerts[0].Above || form.alerts[1].Above)
+                        throw new InvalidOperationException("Alert dialog validation failed.");
+                }
+                form.RenderTest(directory, "alerts-armed.png");
+                form.feed.Accept("[{\"symbol\":\"BTCUSDT\",\"price\":\"68150.00\",\"time\":" + (now + 10) + "}]");
+                form.RefreshQuotes();
+                if (form.alerts.Count != 1 || form.alerts[0].Code != "XAU" || form.firedLog.Count != 1 ||
+                    form.firedLog[0] != "BTCUSDT" || !form.alertedAt.ContainsKey("BTCUSDT"))
+                    throw new InvalidOperationException("Alert trigger validation failed.");
+                form.RefreshQuotes();
+                if (form.firedLog.Count != 1) throw new InvalidOperationException("Alert fired twice.");
+                form.RenderTest(directory, "alerts-fired.png");
                 var entries = ParseCatalog("{\"symbols\":[" + TestContract("HYPE", "COIN", "PERPETUAL", "TRADING") + "," +
                     TestContract("ABCD", "EQUITY", "TRADIFI_PERPETUAL", "TRADING") + "," +
                     TestContract("HKD", "HK_EQUITY", "TRADIFI_PERPETUAL", "TRADING") + "," +
@@ -1659,6 +1857,191 @@ namespace MarketFloat
                     new PointF(r.Left + r.Width * .42f, r.Top + r.Height * .74f),
                     new PointF(r.Left + r.Width * .8f, r.Top + r.Height * .28f) });
             graphics.SmoothingMode = mode;
+        }
+    }
+
+    sealed class AlertDialog : Form
+    {
+        sealed class Choice
+        {
+            public readonly Instrument Item;
+            public Choice(Instrument item) { Item = item; }
+            public override string ToString() { return Item.Code + "  ·  " + Item.Name; }
+        }
+
+        readonly ComboBox symbol = new ComboBox();
+        readonly TextBox price = new TextBox();
+        readonly Label hint = new Label();
+        readonly ListView list = new ListView();
+        readonly System.Windows.Forms.Timer clock = new System.Windows.Forms.Timer { Interval = 1000 };
+        readonly List<Instrument> instruments;
+        readonly List<PriceAlert> alerts;
+        readonly Func<string, Quote> quoteOf;
+        readonly Func<Instrument, int> decimalsOf;
+
+        public AlertDialog(List<Instrument> instruments, List<PriceAlert> alerts, Func<string, Quote> quoteOf,
+            Func<Instrument, int> decimalsOf, string preset)
+        {
+            this.instruments = instruments;
+            this.alerts = alerts;
+            this.quoteOf = quoteOf;
+            this.decimalsOf = decimalsOf;
+            Text = "价格提醒";
+            Font = new Font("Microsoft YaHei UI", 9);
+            AutoScaleMode = AutoScaleMode.Font;
+            ClientSize = new Size(560, 420);
+            MinimumSize = new Size(460, 340);
+            StartPosition = FormStartPosition.CenterParent;
+            MinimizeBox = false;
+            MaximizeBox = false;
+            ShowInTaskbar = false;
+
+            var body = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Padding = new Padding(12) };
+            body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            body.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            Controls.Add(body);
+
+            var entry = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Dock = DockStyle.Fill };
+            entry.Controls.Add(new Label { Text = "品种", AutoSize = true, Margin = new Padding(0, 7, 4, 0) });
+            symbol.DropDownStyle = ComboBoxStyle.DropDownList;
+            symbol.Width = 190;
+            symbol.AccessibleName = "提醒品种";
+            foreach (var item in instruments) symbol.Items.Add(new Choice(item));
+            entry.Controls.Add(symbol);
+            entry.Controls.Add(new Label { Text = "提醒价格", AutoSize = true, Margin = new Padding(12, 7, 4, 0) });
+            price.Width = 130;
+            price.AccessibleName = "提醒价格 (USDT)";
+            entry.Controls.Add(price);
+            var add = new Button { Text = "添加提醒", AutoSize = true, Margin = new Padding(10, 2, 0, 0) };
+            entry.Controls.Add(add);
+            body.Controls.Add(entry, 0, 0);
+
+            hint.AutoSize = true;
+            hint.ForeColor = SystemColors.GrayText;
+            hint.Margin = new Padding(3, 6, 3, 8);
+            body.Controls.Add(hint, 0, 1);
+
+            list.Dock = DockStyle.Fill;
+            list.View = View.Details;
+            list.FullRowSelect = true;
+            list.HeaderStyle = ColumnHeaderStyle.Nonclickable;
+            list.Columns.Add("品种", 130);
+            list.Columns.Add("提醒条件", 170);
+            list.Columns.Add("当前价", 120);
+            list.Columns.Add("状态", 90);
+            body.Controls.Add(list, 0, 2);
+
+            var actions = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = false };
+            var remove = new Button { Text = "删除所选", AutoSize = true };
+            var done = new Button { Text = "关闭", AutoSize = true, DialogResult = DialogResult.OK };
+            var note = new Label { Text = "价格触达后会弹出通知并响铃，每条提醒只触发一次。", AutoSize = true,
+                ForeColor = SystemColors.GrayText, Margin = new Padding(10, 8, 3, 0) };
+            actions.Controls.Add(remove);
+            actions.Controls.Add(done);
+            actions.Controls.Add(note);
+            body.Controls.Add(actions, 0, 3);
+            AcceptButton = add;
+            CancelButton = done;
+
+            symbol.SelectedIndexChanged += delegate { PrefillPrice(); UpdateHint(); };
+            price.TextChanged += delegate { UpdateHint(); };
+            add.Click += delegate
+            {
+                string error = AddAlert();
+                if (error != null) MessageBox.Show(this, error, Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            };
+            remove.Click += delegate
+            {
+                foreach (ListViewItem row in list.SelectedItems) alerts.Remove((PriceAlert)row.Tag);
+                Fill();
+            };
+            list.KeyDown += delegate(object sender, KeyEventArgs e) { if (e.KeyCode == Keys.Delete) remove.PerformClick(); };
+            clock.Tick += delegate { Fill(); UpdateHint(); };
+            clock.Start();
+
+            int index = instruments.FindIndex(i => i.Code == preset);
+            if (symbol.Items.Count > 0) symbol.SelectedIndex = Math.Max(0, index);
+            Fill();
+            ActiveControl = price;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) clock.Dispose();
+            base.Dispose(disposing);
+        }
+
+        Instrument Current { get { var choice = symbol.SelectedItem as Choice; return choice == null ? null : choice.Item; } }
+
+        void PrefillPrice()
+        {
+            var item = Current;
+            var quote = item == null ? null : quoteOf(item.Symbol);
+            price.Text = quote == null ? "" : Widget.PriceText(quote.Price, decimalsOf(item)).Replace(",", "");
+            price.SelectAll();
+        }
+
+        void UpdateHint()
+        {
+            var item = Current;
+            if (item == null) { hint.Text = "请先在“自选品种”中添加品种。"; return; }
+            var quote = quoteOf(item.Symbol);
+            if (quote == null) { hint.Text = item.Symbol + " 暂未收到价格。"; return; }
+            string now = "当前价 " + Widget.PriceText(quote.Price, decimalsOf(item));
+            decimal target;
+            if (!PriceAlert.TryReadPrice(price.Text, out target) || target == quote.Price)
+                hint.Text = now + "。输入高于当前价 = 涨到提醒，低于当前价 = 跌到提醒。";
+            else
+                hint.Text = now + " → 将在价格" + (target > quote.Price ? "涨到 ≥ " : "跌到 ≤ ") +
+                    Widget.PriceText(target, decimalsOf(item)) + " 时提醒（" +
+                    Widget.ChangeText((target - quote.Price) / quote.Price) + "）";
+        }
+
+        // Returns an error message, or null when the alert was added.
+        internal string AddAlert()
+        {
+            var item = Current;
+            if (item == null) return "请先在“自选品种”中添加品种。";
+            decimal target;
+            if (!PriceAlert.TryReadPrice(price.Text, out target)) return "请输入有效的提醒价格，例如 70000。";
+            var quote = quoteOf(item.Symbol);
+            if (quote == null) return item.Symbol + " 暂未收到价格，请稍后再试。";
+            if (target == quote.Price) return "提醒价格不能等于当前价。";
+            if (alerts.Count >= 100) return "提醒数量已达上限（100 条）。";
+            bool above = target > quote.Price;
+            if (alerts.Any(a => a.Code == item.Code && a.Above == above && a.Target == target)) return "已经有相同的提醒了。";
+            alerts.Add(new PriceAlert(item.Code, above, target));
+            Fill();
+            price.Text = "";
+            UpdateHint();
+            return null;
+        }
+
+        internal void SetForTest(string code, string value)
+        {
+            symbol.SelectedIndex = instruments.FindIndex(i => i.Code == code);
+            price.Text = value;
+        }
+
+        void Fill()
+        {
+            var keep = new HashSet<PriceAlert>(list.SelectedItems.Cast<ListViewItem>().Select(r => (PriceAlert)r.Tag));
+            list.BeginUpdate();
+            list.Items.Clear();
+            foreach (var alert in alerts)
+            {
+                var item = instruments.FirstOrDefault(i => i.Code == alert.Code);
+                int decimals = item != null ? decimalsOf(item) : -1;
+                var quote = quoteOf(alert.Symbol);
+                var row = new ListViewItem(new[] { alert.Symbol, alert.Describe(decimals),
+                    quote == null ? "—" : Widget.PriceText(quote.Price, decimals),
+                    item == null ? "不在自选中" : "等待触发" }) { Tag = alert, Selected = keep.Contains(alert) };
+                if (item == null) row.ForeColor = SystemColors.GrayText;
+                list.Items.Add(row);
+            }
+            list.EndUpdate();
         }
     }
 
