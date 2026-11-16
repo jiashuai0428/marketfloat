@@ -1526,45 +1526,51 @@ enum Fonts {
 
 // MARK: - Watchlist picker
 
+/// Watchlist editor: search and tick on the left, the current selection on the right for quick removal.
 final class WatchPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSWindowDelegate {
     private let window: NSWindow
     private let search = NSSearchField()
     private let filter = NSPopUpButton(frame: .zero, pullsDown: false)
     private let table = NSTableView()
+    private let pickedTable = DeletableTableView()
+    private let pickedTitle = NSTextField(labelWithString: "")
     private let status = NSTextField(labelWithString: "")
     private let catalog: [Instrument]
     private let source: String
     private(set) var choices: Set<String>
     private var rows: [Instrument] = []
+    private var picked: [Instrument] = []
 
     init(catalog: [Instrument], selected: Set<String>, source: String) {
         self.catalog = catalog
         self.choices = selected
         self.source = source
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 500),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 860, height: 520),
                           styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         super.init()
         window.title = "自选品种"
-        window.minSize = NSSize(width: 440, height: 360)
+        window.minSize = NSSize(width: 700, height: 400)
         window.delegate = self
         window.isReleasedWhenClosed = false
         let content = window.contentView!
-        let w: CGFloat = 580, h: CGFloat = 500
+        let w: CGFloat = 860, h: CGFloat = 520
+        let split: CGFloat = 510   // left column width
 
-        search.frame = NSRect(x: 16, y: h - 44, width: 360, height: 24)
+        // Left: search, category filter and the full catalog with checkboxes.
+        search.frame = NSRect(x: 16, y: h - 44, width: 340, height: 24)
         search.placeholderString = "搜索代码或名称"
-        search.autoresizingMask = [.width, .minYMargin]
+        search.autoresizingMask = [.minYMargin]
         search.delegate = self
         content.addSubview(search)
 
-        filter.frame = NSRect(x: 388, y: h - 46, width: 176, height: 28)
+        filter.frame = NSRect(x: 366, y: h - 46, width: split - 366, height: 28)
         filter.addItems(withTitles: ["全部品种", "加密货币", "贵金属", "美股／ETF", "已自选"])
-        filter.autoresizingMask = [.minXMargin, .minYMargin]
+        filter.autoresizingMask = [.minYMargin]
         filter.target = self
         filter.action = #selector(reload)
         content.addSubview(filter)
 
-        let columns: [(String, String, CGFloat)] = [("pick", "", 28), ("symbol", "合约代码", 150), ("name", "名称", 190), ("category", "类别", 120)]
+        let columns: [(String, String, CGFloat)] = [("pick", "", 28), ("symbol", "合约代码", 140), ("name", "名称", 170), ("category", "类别", 100)]
         for (id, title, width) in columns {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
             column.title = title
@@ -1577,16 +1583,55 @@ final class WatchPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate, N
         table.delegate = self
         table.target = self
         table.doubleAction = #selector(toggleRow)
-        let scroller = NSScrollView(frame: NSRect(x: 16, y: 56, width: w - 32, height: h - 112))
+        let scroller = NSScrollView(frame: NSRect(x: 16, y: 92, width: split - 16, height: h - 148))
         scroller.documentView = table
         scroller.hasVerticalScroller = true
         scroller.borderType = .bezelBorder
-        scroller.autoresizingMask = [.width, .height]
+        scroller.autoresizingMask = [.height]
         content.addSubview(scroller)
 
-        status.frame = NSRect(x: 16, y: 20, width: 300, height: 18)
+        status.frame = NSRect(x: 16, y: 64, width: split - 16, height: 18)
         status.textColor = .secondaryLabelColor
         content.addSubview(status)
+
+        // Right: what is selected now, with remove actions.
+        pickedTitle.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        pickedTitle.frame = NSRect(x: split + 14, y: h - 42, width: w - split - 30, height: 20)
+        pickedTitle.autoresizingMask = [.width, .minYMargin]
+        content.addSubview(pickedTitle)
+
+        for (id, title, width) in [("symbol", "合约代码", 130), ("name", "名称", 170)] as [(String, String, CGFloat)] {
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
+            column.title = title
+            column.width = width
+            pickedTable.addTableColumn(column)
+        }
+        pickedTable.rowHeight = 22
+        pickedTable.allowsMultipleSelection = true
+        pickedTable.usesAlternatingRowBackgroundColors = true
+        pickedTable.dataSource = self
+        pickedTable.delegate = self
+        pickedTable.target = self
+        pickedTable.doubleAction = #selector(removeClicked)
+        pickedTable.toolTip = "双击或按 Delete 键移除"
+        pickedTable.onDelete = { [weak self] in self?.removeSelected() }
+        let pickedScroller = NSScrollView(frame: NSRect(x: split + 14, y: 92, width: w - split - 30, height: h - 148))
+        pickedScroller.documentView = pickedTable
+        pickedScroller.hasVerticalScroller = true
+        pickedScroller.borderType = .bezelBorder
+        pickedScroller.autoresizingMask = [.width, .height]
+        content.addSubview(pickedScroller)
+
+        let remove = NSButton(title: "移除所选", target: self, action: #selector(removeSelected))
+        remove.frame = NSRect(x: split + 10, y: 54, width: 96, height: 32)
+        content.addSubview(remove)
+        let clear = NSButton(title: "全部清空", target: self, action: #selector(clearAll))
+        clear.frame = NSRect(x: split + 106, y: 54, width: 96, height: 32)
+        content.addSubview(clear)
+        let hint = NSTextField(labelWithString: "双击也可移除")
+        hint.textColor = .secondaryLabelColor
+        hint.frame = NSRect(x: split + 208, y: 62, width: 120, height: 18)
+        content.addSubview(hint)
 
         let apply = NSButton(title: "应用", target: self, action: #selector(applyChoice))
         apply.frame = NSRect(x: w - 106, y: 12, width: 90, height: 32)
@@ -1611,34 +1656,72 @@ final class WatchPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate, N
         return response == .OK ? choices : nil
     }
 
-    @objc private func reload() {
-        let query = search.stringValue.trimmingCharacters(in: .whitespaces)
-        let category = filter.titleOfSelectedItem ?? "全部品种"
+    private func allInstruments() -> [Instrument] {
         let known = Set(catalog.map { $0.code })
         let extras = choices.subtracting(known).sorted().map {
             Instrument(code: $0, name: $0, category: "已自选", metal: false, isDefault: false)
         }
-        rows = (catalog + extras).filter { item in
+        return catalog + extras
+    }
+
+    @objc private func reload() {
+        let query = search.stringValue.trimmingCharacters(in: .whitespaces)
+        let category = filter.titleOfSelectedItem ?? "全部品种"
+        rows = allInstruments().filter { item in
             if category == "已自选" { if !choices.contains(item.code) { return false } }
             else if category != "全部品种" && category != item.category { return false }
             return query.isEmpty || item.symbol.localizedCaseInsensitiveContains(query) ||
                 item.name.localizedCaseInsensitiveContains(query)
         }
         table.reloadData()
-        updateStatus()
+        refreshPicked()
     }
 
-    private func updateStatus() {
-        status.stringValue = "\(source)  ｜  已选 \(choices.count)"
+    private func refreshPicked() {
+        picked = allInstruments().filter { choices.contains($0.code) }
+        pickedTable.reloadData()
+        pickedTitle.stringValue = "已选品种（\(choices.count)）"
+        status.stringValue = "\(source)  ｜  勾选左侧加入自选"
+    }
+
+    private func remove(_ codes: Set<String>) {
+        guard !codes.isEmpty else { return }
+        choices.subtract(codes)
+        if filter.titleOfSelectedItem == "已自选" { reload() } else {
+            table.reloadData()
+            refreshPicked()
+        }
+    }
+
+    @objc private func removeSelected() {
+        remove(Set(pickedTable.selectedRowIndexes.compactMap { $0 < picked.count ? picked[$0].code : nil }))
+    }
+
+    @objc private func removeClicked() {
+        let row = pickedTable.clickedRow
+        guard row >= 0, row < picked.count else { return }
+        remove([picked[row].code])
+    }
+
+    @objc private func clearAll() {
+        guard !choices.isEmpty else { return }
+        let alert = NSAlert()
+        alert.messageText = "确定清空全部 \(choices.count) 个已选品种吗？"
+        alert.addButton(withTitle: "清空")
+        alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            if response == .alertFirstButtonReturn, let self = self { self.remove(self.choices) }
+        }
     }
 
     func controlTextDidChange(_ obj: Notification) { reload() }
 
-    func numberOfRows(in tableView: NSTableView) -> Int { return rows.count }
+    func numberOfRows(in tableView: NSTableView) -> Int { return tableView === pickedTable ? picked.count : rows.count }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard row < rows.count, let id = tableColumn?.identifier.rawValue else { return nil }
-        let item = rows[row]
+        let source = tableView === pickedTable ? picked : rows
+        guard row < source.count, let id = tableColumn?.identifier.rawValue else { return nil }
+        let item = source[row]
         if id == "pick" {
             let box = NSButton(checkboxWithTitle: "", target: self, action: #selector(toggleBox(_:)))
             box.state = choices.contains(item.code) ? .on : .off
@@ -1655,7 +1738,7 @@ final class WatchPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate, N
         guard sender.tag < rows.count else { return }
         let code = rows[sender.tag].code
         if sender.state == .on { choices.insert(code) } else { choices.remove(code) }
-        updateStatus()
+        refreshPicked()
     }
 
     @objc private func toggleRow() {
@@ -1664,7 +1747,7 @@ final class WatchPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate, N
         let code = rows[row].code
         if choices.contains(code) { choices.remove(code) } else { choices.insert(code) }
         table.reloadData(forRowIndexes: IndexSet(integer: row), columnIndexes: IndexSet(integer: 0))
-        updateStatus()
+        refreshPicked()
     }
 
     @objc private func applyChoice() {
@@ -1682,6 +1765,15 @@ final class WatchPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate, N
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         NSApp.stopModal(withCode: .cancel)
         return true
+    }
+}
+
+/// Table view for the selected list that removes rows on Delete / Backspace.
+final class DeletableTableView: NSTableView {
+    var onDelete: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 51 || event.keyCode == 117 { onDelete?() } else { super.keyDown(with: event) }
     }
 }
 

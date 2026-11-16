@@ -1932,8 +1932,16 @@ namespace MarketFloat
                     picker.ToggleForTest("NVDA", "英伟达");
                     picker.ToggleForTest("SNDK", "闪迪");
                     if (picker.Selection.Contains("ETH") || !picker.Selection.Contains("XPT") ||
-                        !picker.Selection.Contains("NVDA") || !picker.Selection.Contains("SNDK") || picker.Selection.Count() != 7)
+                        !picker.Selection.Contains("NVDA") || !picker.Selection.Contains("SNDK") || picker.Selection.Count() != 7 ||
+                        picker.PickedCount != 7)
                         throw new InvalidOperationException("Watchlist validation failed.");
+                    picker.RenderForTest(Path.Combine(directory, "watchlist.png"));
+                    picker.RemoveForTest("XPT");
+                    picker.ToggleForTest("XPT", "XPT");
+                    picker.ToggleForTest("XPT", "XPT");
+                    picker.RemoveForTest("XPT");
+                    if (picker.Selection.Contains("XPT") || picker.Selection.Count() != 6 || picker.PickedCount != 6)
+                        throw new InvalidOperationException("Watchlist removal validation failed.");
                 }
                 form.ClientSize = new Size(form.Width + form.Px(73), form.Height + form.Px(36));
                 form.RememberSize();
@@ -2374,12 +2382,16 @@ namespace MarketFloat
         }
     }
 
+    // Watchlist editor: search and tick on the left, the current selection on the right for quick removal.
     sealed class WatchDialog : Form
     {
         readonly TextBox search = new TextBox();
         readonly ComboBox filter = new ComboBox();
         readonly ListView entries = new ListView();
+        readonly ListView picked = new ListView();
         readonly Label status = new Label();
+        readonly Label pickedTitle = new Label();
+        readonly ToolTip tips = new ToolTip();
         readonly HashSet<string> choices;
         List<Instrument> catalog;
         string source;
@@ -2393,58 +2405,89 @@ namespace MarketFloat
             Text = "自选品种";
             Font = new Font("Microsoft YaHei UI", 9);
             AutoScaleMode = AutoScaleMode.Font;
-            ClientSize = new Size(560, 505);
-            MinimumSize = new Size(420, 360);
+            ClientSize = new Size(860, 540);
+            MinimumSize = new Size(680, 420);
             StartPosition = FormStartPosition.CenterParent;
             MinimizeBox = false;
             MaximizeBox = false;
             ShowInTaskbar = false;
 
-            var body = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3, Padding = new Padding(12) };
-            body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 70));
-            body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30));
+            var body = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4, Padding = new Padding(12) };
+            body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 60));
+            body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40));
             body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             body.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            body.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             Controls.Add(body);
 
-            search.Dock = DockStyle.Fill;
+            // Left: search + category filter + full catalog with checkboxes.
+            var finder = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 4) };
+            finder.Controls.Add(new Label { Text = "搜索", AutoSize = true, Margin = new Padding(3, 7, 4, 0) });
+            search.Width = 220;
             search.AccessibleName = "搜索合约代码或名称";
-            var searchLabel = new Label { Text = "搜索代码或名称", AutoSize = true, Margin = new Padding(3, 0, 3, 4) };
-            var searchBox = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false,
-                FlowDirection = FlowDirection.TopDown, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
-            search.Width = 205;
-            searchBox.Controls.Add(searchLabel);
-            searchBox.Controls.Add(search);
-            body.Controls.Add(searchBox, 0, 0);
-            filter.Dock = DockStyle.Bottom;
+            finder.Controls.Add(search);
             filter.DropDownStyle = ComboBoxStyle.DropDownList;
             filter.AccessibleName = "品种类别";
+            filter.Width = 120;
+            filter.Margin = new Padding(8, 3, 3, 3);
             filter.Items.AddRange(new object[] { "全部品种", "加密货币", "贵金属", "美股／ETF", "已自选" });
             filter.SelectedIndex = 0;
-            body.Controls.Add(filter, 1, 0);
+            finder.Controls.Add(filter);
+            body.Controls.Add(finder, 0, 0);
 
             entries.Dock = DockStyle.Fill;
             entries.CheckBoxes = true;
             entries.View = View.Details;
             entries.FullRowSelect = true;
             entries.HeaderStyle = ColumnHeaderStyle.Nonclickable;
-            entries.Columns.Add("合约代码", 145);
-            entries.Columns.Add("名称", 143);
-            entries.Columns.Add("类别", 100);
+            entries.Columns.Add("合约代码", 135);
+            entries.Columns.Add("名称", 150);
+            entries.Columns.Add("类别", 90);
+            entries.AccessibleName = "全部合约，勾选加入自选";
             body.Controls.Add(entries, 0, 1);
-            body.SetColumnSpan(entries, 2);
+
+            // Right: what is selected now, with remove actions.
+            pickedTitle.AutoSize = true;
+            pickedTitle.Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold);
+            pickedTitle.Margin = new Padding(6, 7, 3, 4);
+            body.Controls.Add(pickedTitle, 1, 0);
+
+            picked.Dock = DockStyle.Fill;
+            picked.View = View.Details;
+            picked.FullRowSelect = true;
+            picked.MultiSelect = true;
+            picked.HideSelection = false;
+            picked.HeaderStyle = ColumnHeaderStyle.Nonclickable;
+            picked.Columns.Add("合约代码", 125);
+            picked.Columns.Add("名称", 150);
+            picked.AccessibleName = "已选品种";
+            picked.Margin = new Padding(6, 3, 3, 3);
+            body.Controls.Add(picked, 1, 1);
 
             status.AutoSize = true;
-            status.Anchor = AnchorStyles.Left;
+            status.ForeColor = SystemColors.GrayText;
+            status.Margin = new Padding(3, 8, 3, 0);
             body.Controls.Add(status, 0, 2);
+
+            var tools = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Dock = DockStyle.Fill, Margin = new Padding(6, 2, 0, 0) };
+            var remove = new Button { Text = "移除所选", AutoSize = true };
+            var clear = new Button { Text = "全部清空", AutoSize = true };
+            tools.Controls.Add(remove);
+            tools.Controls.Add(clear);
+            tips.SetToolTip(picked, "双击或按 Delete 键移除");
+            tools.Controls.Add(new Label { Text = "双击也可移除", AutoSize = true,
+                ForeColor = SystemColors.GrayText, Margin = new Padding(6, 8, 0, 0) });
+            body.Controls.Add(tools, 1, 2);
+
             var actions = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Dock = DockStyle.Right,
-                FlowDirection = FlowDirection.RightToLeft };
+                FlowDirection = FlowDirection.RightToLeft, Margin = new Padding(0, 10, 0, 0) };
             var apply = new Button { Text = "应用", AutoSize = true };
             var cancel = new Button { Text = "取消", AutoSize = true, DialogResult = DialogResult.Cancel };
             actions.Controls.Add(apply);
             actions.Controls.Add(cancel);
-            body.Controls.Add(actions, 1, 2);
+            body.Controls.Add(actions, 0, 3);
+            body.SetColumnSpan(actions, 2);
             CancelButton = cancel;
             apply.Click += delegate
             {
@@ -2462,7 +2505,21 @@ namespace MarketFloat
                 string code = (string)e.Item.Tag;
                 if (e.Item.Checked) choices.Add(code);
                 else choices.Remove(code);
-                UpdateStatus();
+                RefreshPicked();
+            };
+            remove.Click += delegate { RemoveCodes(picked.SelectedItems.Cast<ListViewItem>().Select(r => (string)r.Tag).ToList()); };
+            clear.Click += delegate
+            {
+                if (choices.Count > 0 && MessageBox.Show(this, "确定清空全部 " + choices.Count + " 个已选品种吗？", Text,
+                    MessageBoxButtons.OKCancel, MessageBoxIcon.Question) == DialogResult.OK)
+                    RemoveCodes(choices.ToList());
+            };
+            picked.DoubleClick += delegate { RemoveCodes(picked.SelectedItems.Cast<ListViewItem>().Select(r => (string)r.Tag).ToList()); };
+            picked.KeyDown += delegate(object sender, KeyEventArgs e)
+            {
+                if (e.KeyCode != Keys.Delete && e.KeyCode != Keys.Back) return;
+                remove.PerformClick();
+                e.Handled = true;
             };
             search.TextChanged += delegate { Fill(); };
             filter.SelectedIndexChanged += delegate { Fill(); };
@@ -2477,6 +2534,13 @@ namespace MarketFloat
             Fill();
         }
 
+        IEnumerable<Instrument> AllInstruments()
+        {
+            var known = new HashSet<string>(catalog.Select(item => item.Code));
+            return catalog.Concat(choices.Where(code => !known.Contains(code)).OrderBy(code => code, StringComparer.Ordinal)
+                .Select(code => new Instrument(code, code, category:"已自选")));
+        }
+
         void Fill()
         {
             string query = search.Text.Trim();
@@ -2486,10 +2550,7 @@ namespace MarketFloat
             try
             {
                 entries.Items.Clear();
-                var known = new HashSet<string>(catalog.Select(item => item.Code));
-                var all = catalog.Concat(choices.Where(code => !known.Contains(code))
-                    .Select(code => new Instrument(code, code, category:"已自选")));
-                foreach (var item in all)
+                foreach (var item in AllInstruments())
                 {
                     if (category == "已自选" ? !choices.Contains(item.Code) :
                         category != "全部品种" && category != item.Category) continue;
@@ -2505,12 +2566,44 @@ namespace MarketFloat
                 entries.EndUpdate();
                 filling = false;
             }
-            UpdateStatus();
+            RefreshPicked();
         }
 
-        void UpdateStatus()
+        void RemoveCodes(ICollection<string> codes)
         {
-            status.Text = source + "  ｜  已选 " + choices.Count;
+            if (codes.Count == 0) return;
+            choices.ExceptWith(codes);
+            filling = true;
+            try
+            {
+                foreach (ListViewItem row in entries.Items)
+                    if (codes.Contains((string)row.Tag)) row.Checked = false;
+            }
+            finally { filling = false; }
+            if ((string)filter.SelectedItem == "已自选") Fill();
+            else RefreshPicked();
+        }
+
+        void RefreshPicked()
+        {
+            picked.BeginUpdate();
+            try
+            {
+                picked.Items.Clear();
+                foreach (var item in AllInstruments().Where(i => choices.Contains(i.Code)))
+                    picked.Items.Add(new ListViewItem(new[] { item.Symbol, item.Name }) { Tag = item.Code });
+            }
+            finally { picked.EndUpdate(); }
+            pickedTitle.Text = "已选品种（" + choices.Count + "）";
+            status.Text = source + "  ｜  勾选左侧加入自选";
+        }
+
+        internal int PickedCount { get { return picked.Items.Count; } }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) tips.Dispose();
+            base.Dispose(disposing);
         }
 
         internal void ToggleForTest(string code, string query = null)
@@ -2523,6 +2616,22 @@ namespace MarketFloat
                 return;
             }
             throw new InvalidOperationException("Missing watchlist entry.");
+        }
+
+        internal void RemoveForTest(string code)
+        {
+            foreach (ListViewItem row in picked.Items)
+                row.Selected = Equals(row.Tag, code);
+            RemoveCodes(picked.SelectedItems.Cast<ListViewItem>().Select(r => (string)r.Tag).ToList());
+        }
+
+        internal void RenderForTest(string path)
+        {
+            using (var shot = new Bitmap(Width, Height))
+            {
+                DrawToBitmap(shot, new Rectangle(Point.Empty, Size));
+                shot.Save(path);
+            }
         }
     }
 
